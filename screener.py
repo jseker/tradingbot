@@ -364,10 +364,18 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags):
     L.append('-' * 40)
     total = cfg['portfolio']['total_value']
     reserve = cfg['portfolio']['dry_powder_reserve']
-    L.append('Total portfolio value:    $' + format(total, ','))
-    L.append('Dry powder reserve:       $' + format(reserve, ','))
-    L.append('Available for puts:       $' + format(total - reserve, ','))
-    L.append('Note: Update portfolio value in config.json as it changes.')
+    open_puts, assigned = load_positions()
+    committed = sum([float(p['Strike']) * int(p['Contracts']) * 100 for p in open_puts if p['Strike'] and p['Contracts']])
+    assigned_value = sum([float(a['CostBasis']) * int(a['Shares']) for a in assigned if a['CostBasis'] and a['Shares']])
+    total_deployed = committed + assigned_value
+    available = total - reserve - total_deployed
+    L.append('Total portfolio value:    $' + format(int(total), ','))
+    L.append('Dry powder reserve:       $' + format(int(reserve), ','))
+    L.append('Cash in open puts:        $' + format(int(committed), ','))
+    L.append('Cash in assigned stocks:  $' + format(int(assigned_value), ','))
+    L.append('Total deployed:           $' + format(int(total_deployed), ','))
+    L.append('Available for new puts:   $' + format(int(available), ','))
+    L.append('Note: Update total_value in config.json as it changes.')
     L.append('')
     L.append('SECTION B - WEEKLY PUT CANDIDATES TODAY')
     L.append('-' * 40)
