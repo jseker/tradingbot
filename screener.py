@@ -352,7 +352,7 @@ def get_call_recommendations(assigned, all_data, rules):
         })
     return recommendations
 
-def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags):
+def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned):
     now = datetime.now().strftime('%A %B %d, %Y %I:%M %p')
     L = []
     L.append('=' * 60)
@@ -364,9 +364,18 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags):
     L.append('-' * 40)
     total = cfg['portfolio']['total_value']
     reserve = cfg['portfolio']['dry_powder_reserve']
-    open_puts, assigned = load_positions()
-    committed = sum([float(p['Strike']) * int(p['Contracts']) * 100 for p in open_puts if p['Strike'] and p['Contracts']])
-    assigned_value = sum([float(a['CostBasis']) * int(a['Shares']) for a in assigned if a['CostBasis'] and a['Shares']])
+    committed = 0
+    for p in open_puts:
+        try:
+            committed += float(p['Strike']) * int(p['Contracts']) * 100
+        except:
+            pass
+    assigned_value = 0
+    for a in assigned:
+        try:
+            assigned_value += float(a['CostBasis']) * int(a['Shares'])
+        except:
+            pass
     total_deployed = committed + assigned_value
     available = total - reserve - total_deployed
     L.append('Total portfolio value:    $' + format(int(total), ','))
@@ -551,28 +560,40 @@ def get_performance_summary():
         if not trades:
             return None
         total = len(trades)
-        expired = len([t for t in trades if t['Outcome'] == 'EXPIRED'])
-        assigned = len([t for t in trades if t['Outcome'] == 'ASSIGNED'])
-        called_away = len([t for t in trades if t['Outcome'] == 'CALLED_AWAY'])
-        stop_losses = len([t for t in trades if t['Outcome'] == 'STOP_LOSS'])
-        wins = expired + called_away
+        expired = len([t for t in trades if t.get('Outcome') == 'EXPIRED'])
+        assigned = len([t for t in trades if t.get('Outcome') == 'ASSIGNED'])
+        called_away = len([t for t in trades if t.get('Outcome') == 'CALLED_AWAY'])
+        stop_losses = len([t for t in trades if t.get('Outcome') == 'STOP_LOSS'])
+        btc = len([t for t in trades if t.get('Outcome') == 'BTC'])
+        incomes = [float(t['TotalIncome']) for t in trades if t.get('TotalIncome') is not None]
+        wins = len([i for i in incomes if i > 0])
         win_rate = round(wins / total * 100, 1) if total > 0 else 0
-        returns = [float(t['ReturnPct']) for t in trades if t['ReturnPct'] and float(t['ReturnPct']) > 0]
+        returns = [float(t['ReturnPct']) for t in trades if t.get('ReturnPct') is not None and float(t['ReturnPct']) != 0]
         avg_return = round(sum(returns) / len(returns) * 100, 2) if returns else 0
         best = round(max(returns) * 100, 2) if returns else 0
         worst = round(min(returns) * 100, 2) if returns else 0
-        total_income = sum([float(t['TotalIncome']) for t in trades if t['TotalIncome']])
+        total_premium = sum([float(t['PremiumCollected']) for t in trades if t.get('PremiumCollected') is not None])
+        total_btc_paid = sum([float(t['BTCAmount']) for t in trades if t.get('BTCAmount') is not None])
+        total_call = sum([float(t['CallPremium']) for t in trades if t.get('CallPremium') is not None])
+        total_income = sum([float(t['TotalIncome']) for t in trades if t.get('TotalIncome') is not None])
+        days_list = [int(t['DaysHeld']) for t in trades if t.get('DaysHeld') is not None]
+        avg_days = round(sum(days_list) / len(days_list), 1) if days_list else 0
         return {
             'total': total,
             'expired': expired,
             'assigned': assigned,
             'called_away': called_away,
             'stop_losses': stop_losses,
+            'btc': btc,
             'win_rate': win_rate,
             'avg_return': avg_return,
             'best': best,
             'worst': worst,
-            'total_income': round(total_income, 2)
+            'total_premium': round(total_premium, 2),
+            'total_btc_paid': round(total_btc_paid, 2),
+            'total_call': round(total_call, 2),
+            'total_income': round(total_income, 2),
+            'avg_days': avg_days
         }
     except Exception as ex:
         print('Warning: Could not read performance data: ' + str(ex))
@@ -586,16 +607,21 @@ def build_performance_section():
     if perf is None:
         L.append('No closed trades on file yet.')
     else:
-        L.append('Total trades:           ' + str(perf['total']))
-        L.append('Puts expired worthless: ' + str(perf['expired']))
-        L.append('Puts assigned:          ' + str(perf['assigned']))
-        L.append('Covered calls closed:   ' + str(perf['called_away']))
-        L.append('Stop losses:            ' + str(perf['stop_losses']))
-        L.append('Win rate:               ' + str(perf['win_rate']) + '%')
-        L.append('Avg return per trade:   ' + str(perf['avg_return']) + '%')
-        L.append('Best trade:             ' + str(perf['best']) + '%')
-        L.append('Worst trade:            ' + str(perf['worst']) + '%')
-        L.append('Total income to date:   $' + format(perf['total_income'], ','))
+        L.append('Total trades:             ' + str(perf['total']))
+        L.append('Puts expired worthless:   ' + str(perf['expired']))
+        L.append('Puts assigned:            ' + str(perf['assigned']))
+        L.append('Covered calls closed:     ' + str(perf['called_away']))
+        L.append('Bought to close:          ' + str(perf['btc']))
+        L.append('Stop losses:              ' + str(perf['stop_losses']))
+        L.append('Win rate:                 ' + str(perf['win_rate']) + '%')
+        L.append('Avg return per trade:     ' + str(perf['avg_return']) + '%')
+        L.append('Best trade:               ' + str(perf['best']) + '%')
+        L.append('Worst trade:              ' + str(perf['worst']) + '%')
+        L.append('Total premium collected:  $' + format(perf['total_premium'], ','))
+        L.append('Total BTC paid:           $' + format(perf['total_btc_paid'], ','))
+        L.append('Total call premium:       $' + format(perf['total_call'], ','))
+        L.append('Total net income:         $' + format(perf['total_income'], ','))
+        L.append('Avg days held:            ' + str(perf['avg_days']))
     L.append('')
     L.append('=' * 60)
     L.append('IMPORTANT: All recommendations are estimates only.')
@@ -644,7 +670,7 @@ def main():
     candidates = find_put_candidates(cfg, all_data, earnings_tickers, open_position_tickers)
     longer_candidates = find_longer_dated_candidates(cfg, all_data, earnings_tickers, open_position_tickers)
     print('Building report...')
-    report = build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags)
+    report = build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned)
     longer_section = build_longer_dated_section(longer_candidates)
     sections_cd = build_sections_cd(open_puts, assigned, all_data, rules)
     perf_section = build_performance_section()
