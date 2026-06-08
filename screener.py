@@ -592,9 +592,17 @@ def get_performance_summary():
                 contracts = int(t.get('Contracts') or 1)
                 days_val = t.get('DaysHeld')
                 try:
-                    days = int(float(str(days_val))) if days_val is not None else 0
+                    days = int(float(str(days_val)))
                 except:
-                    days = 0
+                    try:
+                        open_date = t.get('OpenDate')
+                        close_date = t.get('CloseDate')
+                        if open_date and close_date:
+                            days = (close_date - open_date).days
+                        else:
+                            days = 0
+                    except:
+                        days = 0
                 notional = strike * contracts * 100
                 ret_pct = total_income / notional if notional > 0 else 0
                 results.append({
