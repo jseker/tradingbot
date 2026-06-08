@@ -46,6 +46,11 @@ def get_monthly_expiries():
             expiries.append((third_friday.strftime('%Y-%m-%d'), dte))
     return expiries
 
+def clean_header(h):
+    if h is None:
+        return None
+    return str(h).replace('\n', '').replace(' ', '')
+
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -242,7 +247,7 @@ def load_positions():
         assigned_ws = wb['AssignedPositions']
         open_puts = []
         assigned = []
-        puts_headers = [cell.value for cell in puts_ws[3]]
+        puts_headers = [clean_header(cell.value) for cell in puts_ws[3]]
         for row in puts_ws.iter_rows(min_row=4, values_only=True):
             if row[0] is None:
                 continue
@@ -251,7 +256,7 @@ def load_positions():
                 if h is not None:
                     put[h] = row[i]
             open_puts.append(put)
-        assigned_headers = [cell.value for cell in assigned_ws[3]]
+        assigned_headers = [clean_header(cell.value) for cell in assigned_ws[3]]
         for row in assigned_ws.iter_rows(min_row=4, values_only=True):
             if row[0] is None:
                 continue
@@ -270,7 +275,7 @@ def check_stops(assigned, all_data):
     for pos in assigned:
         ticker = pos['Ticker']
         cost_basis = float(pos['CostBasis'])
-        highest = float(pos['HighestPriceSeen']) if pos['HighestPriceSeen'] else cost_basis
+        highest = float(pos['HighestPriceSeen']) if pos.get('HighestPriceSeen') else cost_basis
         if ticker not in all_data or all_data[ticker] is None:
             continue
         current = all_data[ticker]['current']
@@ -311,7 +316,7 @@ def get_call_recommendations(assigned, all_data, rules):
         ticker = pos['Ticker']
         cost_basis = float(pos['CostBasis'])
         shares = int(pos['Shares'])
-        highest = float(pos['HighestPriceSeen']) if pos.get('HighestPriceSeen') else cost_basis
+        highest = float(pos.get('HighestPriceSeen') or cost_basis)
         has_covered_call = pos.get('CoveredCallStrike') is not None
         if has_covered_call:
             continue
@@ -543,14 +548,22 @@ def build_sections_cd(open_puts, assigned, all_data, rules):
         L.append('No open put positions on file.')
     else:
         for p in open_puts:
-            L.append('Ticker: ' + str(p['Ticker']) + ' | Strike: $' + str(p['Strike']) + ' | Expiry: ' + str(p['Expiry']) + ' | Contracts: ' + str(p['Contracts']) + ' | Premium: $' + str(p.get('PremiumCollected', 'N/A')))
+            prem = p.get('PremiumCollected', 'N/A')
+            try:
+                prem_str = '$' + str(round(float(prem), 2))
+            except:
+                prem_str = 'N/A'
+            expiry = p.get('Expiry', 'N/A')
+            expiry_str = expiry.strftime('%Y-%m-%d') if hasattr(expiry, 'strftime') else str(expiry)
+            L.append('Ticker: ' + str(p['Ticker']) + ' | Strike: $' + str(p['Strike']) + ' | Expiry: ' + expiry_str + ' | Contracts: ' + str(p['Contracts']) + ' | Premium: ' + prem_str)
     return '\n'.join(L)
 
 def get_performance_summary():
     try:
         wb = openpyxl.load_workbook('C:\\TradingBot\\positions.xlsx')
         ws = wb['ClosedTrades']
-        headers = [cell.value for cell in ws[3]]
+        raw_headers = [cell.value for cell in ws[3]]
+        headers = [clean_header(h) for h in raw_headers]
         trades = []
         for row in ws.iter_rows(min_row=4, values_only=True):
             if row[0] is None:
@@ -574,11 +587,15 @@ def get_performance_summary():
                 prem = float(t.get('PremiumCollected') or 0)
                 btc_amt = float(t.get('BTCAmount') or 0)
                 call = float(t.get('CallPremium') or 0)
+                total_income = (prem - btc_amt) + call
                 strike = float(t.get('Strike') or 0)
                 contracts = int(t.get('Contracts') or 1)
-                days = int(t.get('DaysHeld') or 0)
+                days_val = t.get('DaysHeld')
+                try:
+                    days = int(float(str(days_val))) if days_val is not None else 0
+                except:
+                    days = 0
                 notional = strike * contracts * 100
-                total_income = (prem - btc_amt) + call
                 ret_pct = total_income / notional if notional > 0 else 0
                 results.append({
                     'total_income': total_income,
