@@ -3,11 +3,524 @@ import smtplib
 import ssl
 from datetime import datetime, date, timedelta
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import pandas_market_calendars as mcal
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import openpyxl
+import urllib.request
+
+# ── MACRO CALENDAR ───────────────────────────────────────────────────
+# Static calendar of recurring major economic events
+# Format: (month, day_type, day_value, event_name, impact)
+# day_type: 'fixed' = specific date, 'weekday' = nth weekday of month
+# This covers the most market-moving events for tech/growth stocks
+
+def get_macro_events(start_date, end_date):
+    events = []
+    current = start_date.replace(day=1)
+    while current <= end_date + timedelta(days=31):
+        year = current.year
+        month = current.month
+
+        # ── CPI (Consumer Price Index) ───────────────────────────────
+        # Usually released 2nd or 3rd Wednesday, ~12th-15th of month
+        cpi_date = get_nth_weekday(year, month, 2, 2)  # 2nd Wednesday
+        if start_date <= cpi_date <= end_date:
+            events.append({
+                'date': cpi_date,
+                'name': 'CPI (Consumer Price Index)',
+                'impact': 'HIGH',
+                'note': 'Major inflation indicator — can move tech stocks 2-4%'
+            })
+
+        # ── PPI (Producer Price Index) ───────────────────────────────
+        # Usually day after CPI
+        ppi_date = cpi_date + timedelta(days=1)
+        if start_date <= ppi_date <= end_date:
+            events.append({
+                'date': ppi_date,
+                'name': 'PPI (Producer Price Index)',
+                'impact': 'MEDIUM',
+                'note': 'Leading indicator for future CPI'
+            })
+
+        # ── Non-Farm Payrolls ─────────────────────────────────────────
+        # First Friday of month
+        nfp_date = get_nth_weekday(year, month, 1, 4)  # 1st Friday
+        if start_date <= nfp_date <= end_date:
+            events.append({
+                'date': nfp_date,
+                'name': 'Non-Farm Payrolls (Jobs Report)',
+                'impact': 'HIGH',
+                'note': 'Strong jobs = rate fears, weak jobs = recession fears'
+            })
+
+        # ── FOMC meetings ─────────────────────────────────────────────
+        # Approximately every 6-7 weeks — hardcode 2026 dates
+        fomc_2026 = [
+            date(2026, 1, 28), date(2026, 3, 18), date(2026, 5, 6),
+            date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
+            date(2026, 11, 4), date(2026, 12, 16)
+        ]
+        for fd in fomc_2026:
+            if start_date <= fd <= end_date:
+                events.append({
+                    'date': fd,
+                    'name': 'FOMC Rate Decision',
+                    'impact': 'HIGH',
+                    'note': 'Fed rate decision — major market mover'
+                })
+
+        # ── PCE Inflation ─────────────────────────────────────────────
+        # Last Friday of month
+        pce_date = get_last_weekday(year, month, 4)  # Last Friday
+        if start_date <= pce_date <= end_date:
+            events.append({
+                'date': pce_date,
+                'name': 'PCE Inflation',
+                'impact': 'HIGH',
+                'note': "Fed's preferred inflation measure"
+            })
+
+        # ── Retail Sales ──────────────────────────────────────────────
+        # Usually mid-month, around 15th-17th
+        retail_date = get_nth_weekday(year, month, 2, 1)  # 2nd Tuesday
+        if start_date <= retail_date <= end_date:
+            events.append({
+                'date': retail_date,
+                'name': 'Retail Sales',
+                'impact': 'MEDIUM',
+                'note': 'Consumer spending indicator'
+            })
+
+        # ── ISM Manufacturing ─────────────────────────────────────────
+        # First business day of month
+        ism_date = get_first_business_day(year, month)
+        if start_date <= ism_date <= end_date:
+            events.append({
+                'date': ism_date,
+                'name': 'ISM Manufacturing PMI',
+                'impact': 'MEDIUM',
+                'note': 'Economic activity indicator'
+            })
+
+        # ── Consumer Confidence ───────────────────────────────────────
+        # Last Tuesday of month
+        conf_date = get_last_weekday(year, month, 1)  # Last Tuesday
+        if start_date <= conf_date <= end_date:
+            events.append({
+                'date': conf_date,
+                'name': 'Consumer Confidence',
+                'impact': 'LOW',
+                'note': 'Consumer sentiment survey'
+            })
+
+        # ── Weekly Jobless Claims ─────────────────────────────────────
+        # Every Thursday — only flag if within 7 days to avoid clutter
+        thursday = get_nth_weekday(year, month, 1, 3)
+        while thursday.month == month:
+            if start_date <= thursday <= end_date:
+                days_away = (thursday - start_date).days
+                if days_away <= 10:
+                    events.append({
+                        'date': thursday,
+                        'name': 'Weekly Jobless Claims',
+                        'impact': 'LOW',
+                        'note': 'Weekly labor market health check'
+                    })
+            thursday += timedelta(days=7)
+
+        # Move to next month
+        if month == 12:
+            current = current.replace(year=year+1, month=1)
+        else:
+            current = current.replace(month=month+1)
+
+    # Deduplicate and sort
+    seen = set()
+    unique_events = []
+    for e in sorted(events, key=lambda x: x['date']):
+        key = (e['date'], e['name'])
+        if key not in seen:
+            seen.add(key)
+            unique_events.append(e)
+
+    return unique_events
+
+def get_nth_weekday(year, month, n, weekday):
+    # weekday: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+    first = date(year, month, 1)
+    first_weekday = first.weekday()
+    days_until = (weekday - first_weekday) % 7
+    first_occurrence = first + timedelta(days=days_until)
+    return first_occurrence + timedelta(weeks=n-1)
+
+def get_last_weekday(year, month, weekday):
+    if month == 12:
+        last = date(year+1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month+1, 1) - timedelta(days=1)
+    days_back = (last.weekday() - weekday) % 7
+    return last - timedelta(days=days_back)
+
+def get_first_business_day(year, month):
+    d = date(year, month, 1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+def build_macro_section(open_puts):
+    L = []
+    L.append('SECTION H - MACRO ECONOMIC CALENDAR')
+    L.append('-' * 40)
+
+    today = date.today()
+
+    # Find furthest expiry across all open puts
+    max_expiry = today + timedelta(days=30)
+    for p in open_puts:
+        try:
+            exp = p.get('Expiry')
+            if exp:
+                if hasattr(exp, 'date'):
+                    exp = exp.date()
+                elif isinstance(exp, datetime):
+                    exp = exp.date()
+                if exp > max_expiry:
+                    max_expiry = exp
+        except:
+            pass
+
+    days_out = (max_expiry - today).days
+    L.append('Scanning macro events from today through ' + max_expiry.strftime('%B %d, %Y'))
+    L.append('(' + str(days_out) + ' days — covers full duration of longest open position)')
+    L.append('')
+
+    events = get_macro_events(today, max_expiry)
+
+    if not events:
+        L.append('No major economic events found in this period.')
+        return '\n'.join(L)
+
+    # Group by impact
+    high_impact = [e for e in events if e['impact'] == 'HIGH']
+    medium_impact = [e for e in events if e['impact'] == 'MEDIUM']
+    low_impact = [e for e in events if e['impact'] == 'LOW']
+
+    if high_impact:
+        L.append('*** HIGH IMPACT EVENTS ***')
+        for e in high_impact:
+            days_away = (e['date'] - today).days
+            day_label = 'TODAY' if days_away == 0 else ('TOMORROW' if days_away == 1 else str(days_away) + ' days away')
+            L.append(e['date'].strftime('%a %b %d') + ' (' + day_label + ') — ' + e['name'])
+            L.append('  Impact: ' + e['note'])
+            # Flag which open positions are affected
+            affected = []
+            for p in open_puts:
+                try:
+                    exp = p.get('Expiry')
+                    if exp:
+                        if hasattr(exp, 'date'):
+                            exp_date = exp.date()
+                        elif isinstance(exp, datetime):
+                            exp_date = exp.date()
+                        else:
+                            exp_date = exp
+                        if exp_date >= e['date']:
+                            affected.append(p['Ticker'] + ' ' + str(p.get('Strike', '')) + ' exp ' + exp_date.strftime('%b %d'))
+                except:
+                    pass
+            if affected:
+                L.append('  Affects open positions: ' + ', '.join(affected))
+            L.append('')
+
+    if medium_impact:
+        L.append('MEDIUM IMPACT EVENTS')
+        for e in medium_impact:
+            days_away = (e['date'] - today).days
+            day_label = str(days_away) + ' days away'
+            L.append(e['date'].strftime('%a %b %d') + ' (' + day_label + ') — ' + e['name'])
+        L.append('')
+
+    if low_impact:
+        L.append('LOW IMPACT EVENTS (within 10 days)')
+        for e in low_impact:
+            days_away = (e['date'] - today).days
+            L.append(e['date'].strftime('%a %b %d') + ' (' + str(days_away) + ' days) — ' + e['name'])
+        L.append('')
+
+    # Overall risk warning
+    next_7_days = [e for e in high_impact if (e['date'] - today).days <= 7]
+    if next_7_days:
+        L.append('*** CAUTION: ' + str(len(next_7_days)) + ' HIGH IMPACT event(s) within 7 days ***')
+        L.append('Consider reducing new position size or waiting until after announcements.')
+    else:
+        L.append('No high impact events in next 7 days — clear to write new positions.')
+
+    return '\n'.join(L)
+
+# ── TECHNICAL ANALYSIS / MEAN REVERSION ─────────────────────────────
+
+def calculate_technicals(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period='3mo')
+        if len(hist) < 20:
+            return None
+
+        closes = hist['Close']
+        volumes = hist['Volume']
+
+        # RSI (14-period)
+        delta = closes.diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(14).mean()
+        avg_loss = loss.rolling(14).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        current_rsi = round(float(rsi.iloc[-1]), 1)
+
+        # Bollinger Bands (20-period, 2 std)
+        sma20 = closes.rolling(20).mean()
+        std20 = closes.rolling(20).std()
+        upper_band = sma20 + (2 * std20)
+        lower_band = sma20 - (2 * std20)
+        current_price = float(closes.iloc[-1])
+        current_sma20 = float(sma20.iloc[-1])
+        current_lower = float(lower_band.iloc[-1])
+        current_upper = float(upper_band.iloc[-1])
+
+        # Distance from moving averages
+        sma50 = closes.rolling(50).mean()
+        current_sma50 = float(sma50.iloc[-1]) if len(closes) >= 50 else None
+
+        pct_from_sma20 = round((current_price - current_sma20) / current_sma20 * 100, 2)
+        pct_from_sma50 = round((current_price - current_sma50) / current_sma50 * 100, 2) if current_sma50 else None
+
+        # Bollinger Band position (0 = lower band, 1 = upper band)
+        bb_position = round((current_price - current_lower) / (current_upper - current_lower), 2) if (current_upper - current_lower) > 0 else 0.5
+
+        # Volume analysis — today vs 20-day average
+        avg_volume = float(volumes.rolling(20).mean().iloc[-1])
+        current_volume = float(volumes.iloc[-1])
+        volume_ratio = round(current_volume / avg_volume, 2) if avg_volume > 0 else 1.0
+
+        # 1-day and 5-day price change
+        change_1d = round((current_price - float(closes.iloc[-2])) / float(closes.iloc[-2]) * 100, 2) if len(closes) >= 2 else 0
+        change_5d = round((current_price - float(closes.iloc[-6])) / float(closes.iloc[-6]) * 100, 2) if len(closes) >= 6 else 0
+
+        return {
+            'ticker': ticker,
+            'current': round(current_price, 2),
+            'rsi': current_rsi,
+            'sma20': round(current_sma20, 2),
+            'sma50': round(current_sma50, 2) if current_sma50 else None,
+            'lower_band': round(current_lower, 2),
+            'upper_band': round(current_upper, 2),
+            'bb_position': bb_position,
+            'pct_from_sma20': pct_from_sma20,
+            'pct_from_sma50': pct_from_sma50,
+            'volume_ratio': volume_ratio,
+            'change_1d': change_1d,
+            'change_5d': change_5d
+        }
+    except Exception as ex:
+        print('  Could not calculate technicals for ' + ticker + ': ' + str(ex))
+        return None
+
+def assess_mean_reversion(tech, cfg):
+    if tech is None:
+        return None
+
+    score = 0
+    signals = []
+    cautions = []
+
+    # RSI signal (most important)
+    if tech['rsi'] < 25:
+        score += 3
+        signals.append('RSI ' + str(tech['rsi']) + ' — extremely oversold')
+    elif tech['rsi'] < 30:
+        score += 2
+        signals.append('RSI ' + str(tech['rsi']) + ' — oversold')
+    elif tech['rsi'] < 35:
+        score += 1
+        signals.append('RSI ' + str(tech['rsi']) + ' — approaching oversold')
+    elif tech['rsi'] > 70:
+        cautions.append('RSI ' + str(tech['rsi']) + ' — overbought, not a put writing opportunity')
+        return None
+
+    # Bollinger Band signal
+    if tech['bb_position'] < 0.05:
+        score += 3
+        signals.append('Price at/below lower Bollinger Band — statistically extreme')
+    elif tech['bb_position'] < 0.15:
+        score += 2
+        signals.append('Price near lower Bollinger Band (BB position: ' + str(tech['bb_position']) + ')')
+    elif tech['bb_position'] < 0.25:
+        score += 1
+        signals.append('Price below lower quarter of Bollinger Bands')
+
+    # Distance from SMA20
+    if tech['pct_from_sma20'] < -10:
+        score += 2
+        signals.append(str(abs(tech['pct_from_sma20'])) + '% below 20-day moving average')
+    elif tech['pct_from_sma20'] < -5:
+        score += 1
+        signals.append(str(abs(tech['pct_from_sma20'])) + '% below 20-day moving average')
+
+    # Volume analysis
+    if tech['volume_ratio'] < 0.7:
+        score += 1
+        signals.append('Low volume drop (' + str(tech['volume_ratio']) + 'x avg) — suggests technical not fundamental')
+    elif tech['volume_ratio'] > 2.0:
+        cautions.append('High volume drop (' + str(tech['volume_ratio']) + 'x avg) — may signal genuine selling pressure')
+        score -= 1
+
+    # 5-day change
+    if tech['change_5d'] < -10:
+        score += 1
+        signals.append(str(tech['change_5d']) + '% drop over 5 days — extended move, bounce likely')
+
+    # Minimum score threshold
+    if score < 2:
+        return None
+
+    # Conviction level
+    if score >= 5:
+        conviction = 'HIGH CONVICTION'
+    elif score >= 3:
+        conviction = 'MODERATE'
+    else:
+        conviction = 'WATCH'
+
+    # Suggested strikes
+    current = tech['current']
+    weekly_strike = round(current * 0.95, 2)  # 5% OTM for weekly
+    monthly_strike = round(current * 0.88, 2)  # 12% OTM for monthly
+
+    return {
+        'ticker': tech['ticker'],
+        'conviction': conviction,
+        'score': score,
+        'signals': signals,
+        'cautions': cautions,
+        'tech': tech,
+        'weekly_strike': weekly_strike,
+        'monthly_strike': monthly_strike
+    }
+
+def find_mean_reversion_candidates(cfg, all_data, earnings_tickers, open_positions):
+    tier1 = cfg['tiers']['tier1']
+    tier2 = cfg['tiers']['tier2']
+    exclusions = cfg['exclusions']
+    earnings_list = [e[0] for e in earnings_tickers]
+    candidates = []
+
+    for ticker in tier1 + tier2:
+        if ticker in exclusions:
+            continue
+        if ticker in earnings_list:
+            continue
+        if ticker in open_positions:
+            continue
+        if all_data.get(ticker) is None:
+            continue
+
+        # Check proximity to 52W high
+        data = all_data[ticker]
+        if data['high_proximity_pct'] > cfg['rules']['high_proximity_pct'] * 100:
+            continue
+
+        # Must have dropped at least 2% recently (not a flat stock)
+        if data['pre_market_change_pct'] > 0 and data['high_proximity_pct'] < 3:
+            continue
+
+        print('  Calculating technicals for ' + ticker + '...')
+        tech = calculate_technicals(ticker)
+        if tech is None:
+            continue
+
+        # Must have dropped without peer confirmation (isolating from sympathy drops)
+        # Check if peers are also down — if yes it is sympathy not mean reversion
+        peer_groups = cfg['peer_groups']
+        ticker_group = None
+        for group_name, members in peer_groups.items():
+            if ticker in members:
+                ticker_group = group_name
+                break
+
+        if ticker_group:
+            peers_also_down = 0
+            for peer in peer_groups[ticker_group]:
+                if peer == ticker or peer not in all_data or all_data[peer] is None:
+                    continue
+                if all_data[peer]['pre_market_change_pct'] < -2.0:
+                    peers_also_down += 1
+            # If 2+ peers also down, it is sympathy — skip (handled by Section B)
+            if peers_also_down >= 2:
+                continue
+
+        result = assess_mean_reversion(tech, cfg)
+        if result is not None:
+            candidates.append(result)
+
+    # Sort by conviction score
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    return candidates
+
+def build_mean_reversion_section(candidates, earnings_tickers):
+    L = []
+    L.append('SECTION G - MEAN REVERSION CANDIDATES')
+    L.append('-' * 40)
+    L.append('Stocks that have dropped for no apparent fundamental reason.')
+    L.append('Technical analysis suggests potential bounce / mean reversion.')
+    L.append('These are ISOLATED drops — not confirmed by peers (see Section B for sympathy drops).')
+    L.append('')
+
+    if not candidates:
+        L.append('No mean reversion candidates today.')
+        L.append('Either no significant isolated drops, or RSI/Bollinger signals not triggered.')
+        return '\n'.join(L)
+
+    next_friday = get_next_friday()
+
+    for c in candidates:
+        tech = c['tech']
+        L.append('*** ' + c['ticker'] + ' — ' + c['conviction'] + ' (Score: ' + str(c['score']) + '/8) ***')
+        L.append('Current price:      $' + str(tech['current']))
+        L.append('RSI (14):           ' + str(tech['rsi']) + ' ' + ('OVERSOLD' if tech['rsi'] < 30 else ('Near oversold' if tech['rsi'] < 35 else '')))
+        L.append('20-day SMA:         $' + str(tech['sma20']) + ' (' + str(tech['pct_from_sma20']) + '% from price)')
+        if tech['sma50']:
+            L.append('50-day SMA:         $' + str(tech['sma50']) + ' (' + str(tech['pct_from_sma50']) + '% from price)')
+        L.append('Lower Bollinger:    $' + str(tech['lower_band']))
+        L.append('Upper Bollinger:    $' + str(tech['upper_band']))
+        L.append('BB Position:        ' + str(tech['bb_position']) + ' (0=lower band, 1=upper band)')
+        L.append('Volume ratio:       ' + str(tech['volume_ratio']) + 'x average')
+        L.append('1-day change:       ' + str(tech['change_1d']) + '%')
+        L.append('5-day change:       ' + str(tech['change_5d']) + '%')
+        L.append('')
+        L.append('Technical signals:')
+        for s in c['signals']:
+            L.append('  + ' + s)
+        if c['cautions']:
+            L.append('Cautions:')
+            for ca in c['cautions']:
+                L.append('  ! ' + ca)
+        L.append('')
+        L.append('Suggested put strikes:')
+        L.append('  Weekly (' + next_friday + '): $' + str(c['weekly_strike']) + ' (~5% OTM)')
+        L.append('  Monthly (next expiry):   $' + str(c['monthly_strike']) + ' (~12% OTM)')
+        L.append('*** Verify delta, premium and IV in ATP before trading ***')
+        L.append('')
+        L.append('-' * 40)
+
+    return '\n'.join(L)
+
+# ── EXISTING FUNCTIONS ────────────────────────────────────────────────
 
 def load_config():
     with open('C:\\TradingBot\\config.json') as f:
@@ -323,9 +836,9 @@ def get_call_recommendations(assigned, all_data, rules):
         if ticker not in all_data or all_data[ticker] is None:
             continue
         current = all_data[ticker]['current']
-        static_stop = round(cost_basis * 0.95, 2)
         trailing_active = highest >= cost_basis * 1.10
         trailing_stop = round(highest * 0.95, 2)
+        static_stop = round(cost_basis * 0.95, 2)
         stop_price = trailing_stop if trailing_active else static_stop
         pnl_pct = round((current - cost_basis) / cost_basis * 100, 2)
         if current <= stop_price * 1.03:
@@ -706,7 +1219,7 @@ def main():
     open_puts, assigned = load_positions()
     open_position_tickers = [p['Ticker'] for p in open_puts] + [a['Ticker'] for a in assigned]
     watchlist = cfg['watchlist']
-    print('Fetching data for ' + str(len(watchlist)) + ' stocks...')
+    print('Fetching stock data for ' + str(len(watchlist)) + ' stocks...')
     all_data = {}
     for ticker in watchlist:
         print('  Fetching ' + ticker + '...')
@@ -718,15 +1231,25 @@ def main():
     for ticker, data in all_data.items():
         if data and abs(data['pre_market_change_pct']) >= 5.0:
             watchlist_flags.append({'ticker': ticker, 'change': data['pre_market_change_pct']})
-    print('Finding put candidates...')
+    print('Finding sympathy drop candidates...')
     candidates = find_put_candidates(cfg, all_data, earnings_tickers, open_position_tickers)
     longer_candidates = find_longer_dated_candidates(cfg, all_data, earnings_tickers, open_position_tickers)
+    print('Calculating technicals for mean reversion screen...')
+    mean_reversion_candidates = find_mean_reversion_candidates(cfg, all_data, earnings_tickers, open_position_tickers)
+    print('Building macro calendar...')
+    macro_section = build_macro_section(open_puts)
     print('Building report...')
     report = build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned)
     longer_section = build_longer_dated_section(longer_candidates)
+    mean_reversion_section = build_mean_reversion_section(mean_reversion_candidates, earnings_tickers)
     sections_cd = build_sections_cd(open_puts, assigned, all_data, rules)
     perf_section = build_performance_section()
-    full_report = report + '\n' + longer_section + '\n' + sections_cd + '\n' + perf_section
+    full_report = (report + '\n' +
+                   longer_section + '\n' +
+                   mean_reversion_section + '\n' +
+                   sections_cd + '\n' +
+                   perf_section + '\n' +
+                   macro_section)
     print('')
     print(full_report)
     print('')
