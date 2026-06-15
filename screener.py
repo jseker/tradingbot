@@ -1094,6 +1094,190 @@ def build_sections_cd(open_puts, assigned, all_data, rules):
                 L.append('  Macro events before expiry: ' + str(macro_flag))
     return '\n'.join(L)
 
+def find_buy_write_candidates(cfg, all_data, earnings_tickers, tech_cache):
+    tier1 = cfg['tiers']['tier1']
+    tier2 = cfg['tiers']['tier2']
+    exclusions = cfg['exclusions']
+    earnings_list = [e[0] for e in earnings_tickers]
+    candidates = []
+    for ticker in tier1 + tier2:
+        if ticker in exclusions or ticker in earnings_list:
+            continue
+        data = all_data.get(ticker)
+        if data is None:
+            continue
+        # Must be within 15% of 52W high — quality filter
+        if data['high_proximity_pct'] > 15:
+            continue
+        current = data['current']
+        # Call strike ~5% below current price
+        call_strike = round(current * 0.95, 2)
+        # Fetch IV to estimate ITM call premium
+        iv_data = None
+        try:
+            stock = yf.Ticker(ticker)
+            opt_dates = stock.options
+            if opt_dates:
+                # Use nearest expiry
+                chain = stock.option_chain(opt_dates[0])
+                calls = chain.calls
+                # Find closest call to 5% OTM strike
+                atm_calls = calls[abs(calls['strike'] - call_strike) < current * 0.03]
+                if not atm_calls.empty:
+                    iv = float(atm_calls['impliedVolatility'].mean())
+                    bid = float(atm_calls['bid'].mean())
+                    ask = float(atm_calls['ask'].mean())
+                    mid = round((bid + ask) / 2, 2)
+                    # Estimated premium per share
+                    intrinsic = max(0, current - call_strike)
+                    time_value = max(0, mid - intrinsic)
+                    # Net return if called away
+                    stock_loss = call_strike - current  # negative
+                    net_per_share = mid + stock_loss
+                    net_pct = net_per_share / current
+                    if net_pct >= 0.01:  # meets 1% weekly target
+                        # Get analyst data
+                        analyst = get_analyst_data(ticker)
+                        tech = tech_cache.get(ticker)
+                        earnings_dt, earnings_days = get_earnings_date(ticker)
+                        candidates.append({
+                            'ticker': ticker,
+                            'current': current,
+                            'call_strike': call_strike,
+                            'call_premium_mid': mid,
+                            'intrinsic': round(intrinsic, 2),
+                            'time_value': round(time_value, 2),
+                            'stock_loss_per_share': round(stock_loss, 2),
+                            'net_per_share': round(net_per_share, 2),
+                            'net_pct': round(net_pct * 100, 2),
+                            'expiry': opt_dates[0],
+                            'analyst': analyst,
+                            'tech': tech,
+                            'earnings_dt': earnings_dt,
+                            'earnings_days': earnings_days,
+                            'iv': round(iv * 100, 1),
+                            'proximity_pct': data['high_proximity_pct'],
+                            'week_high': data['week_high'],
+                        })
+        except Exception as ex:
+            pass
+    # Sort by net return percentage descending
+    candidates.sort(key=lambda x: x['net_pct'], reverse=True)
+    return candidates[:5]  # top 5 candidates
+
+def build_buy_write_section(candidates, macro_events):
+    L = []
+    L.append('SECTION I - BUY-WRITE CANDIDATES')
+    L.append('-' * 40)
+    L.append('Buy stock + immediately write ITM call ~5% below purchase price.')
+    L.append('Target: call premium > stock loss if called away, netting 1%+ weekly.')
+    L.append('Only shows candidates where net return meets 1% weekly target.')
+    L.append('')
+    if not candidates:
+        L.append('No buy-write candidates meeting 1% weekly target today.')
+        L.append('IV may be too low, or no suitable names available.')
+        return '\n'.join(L)
+    today = date.today()
+    next_7_high = [e for e in macro_events if e['impact'] == 'HIGH' and (e['date'] - today).days <= 7]
+    macro_warn = next_7_high[0]['name'] if next_7_high else None
+    for c in candidates:
+        analyst = c.get('analyst')
+        tech = c.get('tech')
+        # Determine recommendation
+        verdict = 'CONSIDER'
+        reasons_for = []
+        reasons_against = []
+        if c['net_pct'] >= 2.0:
+            reasons_for.append('Net return ' + str(c['net_pct']) + '% — well above 1% weekly target')
+            verdict = 'WRITE NOW'
+        elif c['net_pct'] >= 1.0:
+            reasons_for.append('Net return ' + str(c['net_pct']) + '% — meets 1% weekly target')
+            verdict = 'CONSIDER'
+        if c['earnings_days'] is not None and c['earnings_days'] <= 5:
+            verdict = 'AVOID'
+            reasons_against.append('EARNINGS IN ' + str(c['earnings_days']) + ' DAYS — DO NOT enter')
+        elif c['earnings_days'] is not None and c['earnings_days'] <= 14:
+            verdict = 'CAUTION'
+            reasons_against.append('Earnings in ' + str(c['earnings_days']) + ' days')
+        if macro_warn:
+            reasons_against.append('High impact macro event within 7 days: ' + macro_warn)
+            if verdict == 'WRITE NOW':
+                verdict = 'CONSIDER'
+        if tech:
+            if tech['rsi'] > 70:
+                reasons_against.append('RSI ' + str(tech['rsi']) + ' — overbought, stock may pull back')
+                if verdict == 'WRITE NOW': verdict = 'CONSIDER'
+            elif tech['rsi'] < 40:
+                reasons_for.append('RSI ' + str(tech['rsi']) + ' — oversold, downside limited')
+        if analyst:
+            if analyst.get('beta_risk') == 'VERY HIGH':
+                reasons_against.append('Beta ' + str(analyst['beta']) + ' — very high beta, gap risk')
+            elif analyst.get('beta_risk') == 'HIGH':
+                reasons_against.append('Beta ' + str(analyst['beta']) + ' — high beta, size conservatively')
+            if analyst.get('upside') and analyst['upside'] > 15:
+                reasons_against.append('Analyst target ' + str(analyst['upside']) + '% above current — consider if you want stock called away')
+        L.append('*** ' + c['ticker'] + ' — ' + verdict + ' ***')
+        L.append('Current price:      $' + str(c['current']))
+        L.append('52W high:           $' + str(c['week_high']) + ' (' + str(c['proximity_pct']) + '% below high)')
+        L.append('Call strike (5%):   $' + str(c['call_strike']) + ' | Expiry: ' + c['expiry'])
+        L.append('Call premium (mid): $' + str(c['call_premium_mid']) + '/share')
+        L.append('  Intrinsic value:  $' + str(c['intrinsic']) + '/share')
+        L.append('  Time value:       $' + str(c['time_value']) + '/share')
+        L.append('Stock loss if called: $' + str(abs(c['stock_loss_per_share'])) + '/share')
+        L.append('NET RETURN if called: $' + str(c['net_per_share']) + '/share = ' + str(c['net_pct']) + '% weekly')
+        L.append('IV (implied vol):   ' + str(c['iv']) + '%')
+        if analyst:
+            if analyst.get('target'):
+                L.append('Analyst target:     $' + str(analyst['target']) + ' (' + str(analyst['upside']) + '% upside) | ' + str(analyst['rec']))
+            if analyst.get('beta_text'):
+                L.append('Beta:               ' + analyst['beta_text'])
+        if c['earnings_days'] is not None:
+            L.append('Earnings:           ' + str(c['earnings_dt']) + ' (' + str(c['earnings_days']) + ' days)')
+        if tech:
+            L.append('RSI:                ' + str(tech['rsi']) + ' | BB Position: ' + str(tech['bb_position']))
+        L.append('')
+        L.append('RECOMMENDATION: *** ' + verdict + ' ***')
+        for r in reasons_for:
+            L.append('  + ' + r)
+        for r in reasons_against:
+            L.append('  - ' + r)
+        L.append('')
+        # ATP order ticket
+        shares_tier1 = 100  # 1 contract worth
+        cost = round(c['current'] * shares_tier1, 2)
+        L.append('ATP ORDER TICKET (1 contract = 100 shares)')
+        L.append('  Step 1: BUY 100 shares of ' + c['ticker'] + ' at market ($' + str(c['current']) + '/share = $' + format(int(cost), ',') + ')')
+        L.append('  Step 2: SELL TO OPEN CALL | Strike: $' + str(c['call_strike']) + ' | Expiry: ' + c['expiry'] + ' | Contracts: 1 | LIMIT at mid ($' + str(c['call_premium_mid']) + ')')
+        L.append('  Net cost basis: $' + str(round(c['current'] - c['call_premium_mid'], 2)) + '/share')
+        L.append('  Max gain if called away: $' + str(round(c['net_per_share'] * 100, 2)) + ' total')
+        L.append('*** Verify actual bid/ask in ATP before placing order ***')
+        L.append('')
+        L.append('-' * 40)
+    return '\n'.join(L)
+
+def update_buy_writes_macro_flags(macro_events):
+    try:
+        wb = openpyxl.load_workbook(POSITIONS_FILE)
+        if 'BuyWrites' not in wb.sheetnames:
+            return
+        ws_bw = wb['BuyWrites']
+        for row in range(5, 1005):
+            ticker = ws_bw.cell(row=row, column=1).value
+            if ticker is None:
+                break
+            expiry_val = ws_bw.cell(row=row, column=6).value
+            if expiry_val:
+                flag = get_macro_flag_string(expiry_val, macro_events)
+                c = ws_bw.cell(row=row, column=15)
+                c.value = flag
+                from openpyxl.styles import Font as OFont
+                c.font = OFont(color='FFB347' if flag and flag != 'None' else '00E5CC',
+                               size=9, name='Calibri')
+        wb.save(POSITIONS_FILE)
+        print('  BuyWrites MacroRiskFlag updated')
+    except Exception as ex:
+        print('Warning: Could not update BuyWrites macro flags: ' + str(ex))
+
 def build_macro_section(open_puts, macro_events):
     L = []
     L.append('SECTION H - MACRO ECONOMIC CALENDAR')
@@ -1303,8 +1487,11 @@ def main():
     longer_candidates = find_longer_dated_candidates(cfg, all_data, earnings_tickers, open_position_tickers)
     print('Running mean reversion screen...')
     mean_reversion_candidates = find_mean_reversion_candidates(cfg, all_data, earnings_tickers, open_position_tickers, tech_cache)
-    print('Updating Excel file (MacroRiskFlag, TechnicalSnapshot, MacroCalendar)...')
+    print('Finding buy-write candidates...')
+    buy_write_candidates = find_buy_write_candidates(cfg, all_data, earnings_tickers, tech_cache)
+    print('Updating Excel file (MacroRiskFlag, TechnicalSnapshot, MacroCalendar, BuyWrites)...')
     update_excel(open_puts, macro_events, tech_cache)
+    update_buy_writes_macro_flags(macro_events)
     print('Reloading positions after Excel update...')
     open_puts, assigned = load_positions()
     print('Building report...')
@@ -1315,9 +1502,10 @@ def main():
     sections_cd = build_sections_cd(open_puts, assigned, all_data, rules)
     perf_section = build_performance_section()
     macro_section = build_macro_section(open_puts, macro_events)
+    buy_write_section = build_buy_write_section(buy_write_candidates, macro_events)
     full_report = (regime_section + '\n' + report + '\n' + longer_section + '\n' +
-                   mean_reversion_section + '\n' + sections_cd + '\n' +
-                   perf_section + '\n' + macro_section)
+                   mean_reversion_section + '\n' + buy_write_section + '\n' +
+                   sections_cd + '\n' + perf_section + '\n' + macro_section)
     print('')
     print(full_report)
     print('')
