@@ -12,6 +12,29 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 POSITIONS_FILE = 'C:\\TradingBot\\positions.xlsx'
+POSITIONS_TEMP = 'C:\\TradingBot\\positions_temp.xlsx'
+
+def safe_save(wb):
+    import shutil, os
+    try:
+        wb.save(POSITIONS_TEMP)
+        test = openpyxl.load_workbook(POSITIONS_TEMP)
+        test.close()
+        os.replace(POSITIONS_TEMP, POSITIONS_FILE)
+        return True
+    except PermissionError:
+        print('  WARNING: positions.xlsx is open in Excel — skipping update to avoid corruption.')
+        print('  Close Excel before running the screener for TechnicalSnapshot updates.')
+        try:
+            if os.path.exists(POSITIONS_TEMP): os.remove(POSITIONS_TEMP)
+        except: pass
+        return False
+    except Exception as ex:
+        print('  WARNING: Could not save positions.xlsx: ' + str(ex))
+        try:
+            if os.path.exists(POSITIONS_TEMP): os.remove(POSITIONS_TEMP)
+        except: pass
+        return False
 
 # ── STYLE HELPERS ────────────────────────────────────────────────────
 def bg(h): return PatternFill(start_color=h, end_color=h, fill_type='solid')
@@ -514,7 +537,7 @@ def update_excel(open_puts, macro_events, tech_data_cache):
             ws_mc.row_dimensions[row].height = 20
         print('  MacroCalendar updated')
 
-        wb.save(POSITIONS_FILE)
+        safe_save(wb)
         print('  Excel file saved successfully')
     except Exception as ex:
         print('Warning: Could not update Excel: ' + str(ex))
@@ -755,7 +778,7 @@ def find_mean_reversion_candidates(cfg, all_data, earnings_tickers, open_positio
 
 def load_positions():
     try:
-        wb = openpyxl.load_workbook(POSITIONS_FILE)
+        wb = openpyxl.load_workbook(POSITIONS_FILE, read_only=True, data_only=True)
         puts_ws = wb['OpenPuts']
         assigned_ws = wb['AssignedPositions']
         open_puts = []
@@ -920,13 +943,16 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, o
     reserve = cfg['portfolio']['dry_powder_reserve']
     committed = sum(float(p.get('Strike',0)) * int(p.get('Contracts',1)) * 100 for p in open_puts if p.get('Strike'))
     assigned_value = sum(float(a.get('CostBasis',0)) * int(a.get('Shares',0)) for a in assigned if a.get('CostBasis'))
-    # BuyWrites capital = PurchasePrice x Shares
+    # BuyWrites capital = PurchasePrice x Shares (use raw columns, not formula columns)
     bw_value = 0
     for bw in buy_writes:
         try:
-            price = float(bw.get('PurchasePrice') or bw.get('Purchase\nPrice') or 0)
-            shares = int(bw.get('Shares') or 0)
-            bw_value += price * shares
+            price = bw.get('PurchasePrice') or bw.get('Purchase\nPrice') or 0
+            shares = bw.get('Shares') or 0
+            # Skip if either is a formula string
+            if isinstance(price, str) or isinstance(shares, str):
+                continue
+            bw_value += float(price) * int(shares)
         except:
             pass
     total_deployed = committed + assigned_value + bw_value
@@ -1511,7 +1537,7 @@ def update_buy_writes_macro_flags(macro_events):
                 from openpyxl.styles import Font as OFont
                 c.font = OFont(color='FFB347' if flag and flag != 'None' else '00E5CC',
                                size=9, name='Calibri')
-        wb.save(POSITIONS_FILE)
+        safe_save(wb)
         print('  BuyWrites MacroRiskFlag updated')
     except Exception as ex:
         print('Warning: Could not update BuyWrites macro flags: ' + str(ex))
@@ -1576,7 +1602,7 @@ def build_macro_section(open_puts, macro_events):
 
 def get_performance_summary():
     try:
-        wb = openpyxl.load_workbook(POSITIONS_FILE)
+        wb = openpyxl.load_workbook(POSITIONS_FILE, read_only=True, data_only=True)
         ws = wb['ClosedTrades']
         headers = [clean_header(c.value) for c in ws[3]]
         trades = []
@@ -1730,8 +1756,11 @@ def main():
     print('Updating Excel file (MacroRiskFlag, TechnicalSnapshot, MacroCalendar, BuyWrites)...')
     update_excel(open_puts, macro_events, tech_cache)
     update_buy_writes_macro_flags(macro_events)
-    print('Reloading positions after Excel update...')
-    open_puts, assigned, buy_writes = load_positions()
+    print('Reloading open puts and assigned after Excel update...')
+    open_puts_fresh, assigned_fresh, _ = load_positions()
+    # Keep buy_writes from original load — Excel formulas corrupt on reload
+    open_puts = open_puts_fresh
+    assigned = assigned_fresh
     print('Building report...')
     regime_section = build_market_regime_section(vix, spy_trend, macro_events)
     report = build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned, buy_writes, macro_events, vix)
