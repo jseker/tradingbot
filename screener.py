@@ -108,14 +108,37 @@ def get_vix():
 def get_spy_trend():
     try:
         spy = yf.Ticker('SPY')
-        hist = spy.history(period='3mo')
-        if len(hist) < 50:
+        # Try 6mo first for more data, fall back to 3mo
+        hist = spy.history(period='6mo')
+        if hist is None or hist.empty:
+            hist = spy.history(period='3mo')
+        if hist is None or hist.empty:
             return None
-        current = float(hist['Close'].iloc[-1])
-        sma20 = float(hist['Close'].rolling(20).mean().iloc[-1])
-        sma50 = float(hist['Close'].rolling(50).mean().iloc[-1])
-        change_1d = round((current - float(hist['Close'].iloc[-2])) / float(hist['Close'].iloc[-2]) * 100, 2)
-        change_5d = round((current - float(hist['Close'].iloc[-6])) / float(hist['Close'].iloc[-6]) * 100, 2)
+        # Drop any NaN rows entirely
+        hist = hist.dropna(subset=['Close'])
+        closes = hist['Close'].astype(float)
+        if len(closes) < 50:
+            return None
+        # Use last valid close — sometimes today's bar has NaN if pre-market
+        # Walk back until we find a valid non-NaN close
+        current = None
+        for i in range(len(closes)-1, -1, -1):
+            val = closes.iloc[i]
+            if not np.isnan(val) and val > 0:
+                current = float(val)
+                break
+        if current is None:
+            return None
+        # Previous closes for change calculation
+        valid_closes = closes[~np.isnan(closes) & (closes > 0)]
+        prev1 = float(valid_closes.iloc[-2]) if len(valid_closes) >= 2 else current
+        prev5 = float(valid_closes.iloc[-6]) if len(valid_closes) >= 6 else current
+        sma20 = float(valid_closes.rolling(20).mean().dropna().iloc[-1])
+        sma50 = float(valid_closes.rolling(50).mean().dropna().iloc[-1])
+        if np.isnan(sma20) or np.isnan(sma50):
+            return None
+        change_1d = round((current - prev1) / prev1 * 100, 2) if prev1 > 0 else 0
+        change_5d = round((current - prev5) / prev5 * 100, 2) if prev5 > 0 else 0
         if current > sma20 and current > sma50:
             trend = 'UPTREND'
         elif current < sma20 and current < sma50:
@@ -124,7 +147,8 @@ def get_spy_trend():
             trend = 'MIXED'
         return {'current':round(current,2),'sma20':round(sma20,2),'sma50':round(sma50,2),
                 'trend':trend,'change_1d':change_1d,'change_5d':change_5d}
-    except:
+    except Exception as ex:
+        print('Warning: SPY trend fetch failed: ' + str(ex))
         return None
 
 def get_market_regime(vix, spy_trend):
@@ -229,38 +253,51 @@ def get_earnings_date(ticker):
 def calculate_technicals(ticker):
     try:
         hist = yf.Ticker(ticker).history(period='3mo')
-        if len(hist) < 20:
+        if hist is None or hist.empty or len(hist) < 20:
             return None
-        closes = hist['Close']
-        volumes = hist['Volume']
+        closes = hist['Close'].dropna()
+        volumes = hist['Volume'].dropna()
+        if len(closes) < 20:
+            return None
+        current = float(closes.iloc[-1])
+        if np.isnan(current) or current <= 0:
+            return None
         delta = closes.diff()
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
-        rs = gain.rolling(14).mean() / loss.rolling(14).mean()
-        rsi = round(float((100 - (100 / (1 + rs))).iloc[-1]), 1)
+        avg_gain = gain.rolling(14).mean()
+        avg_loss = loss.rolling(14).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi_series = 100 - (100 / (1 + rs))
+        rsi_val = float(rsi_series.dropna().iloc[-1]) if not rsi_series.dropna().empty else 50.0
+        if np.isnan(rsi_val):
+            rsi_val = 50.0
         sma20 = closes.rolling(20).mean()
         std20 = closes.rolling(20).std()
         upper_bb = sma20 + 2*std20
         lower_bb = sma20 - 2*std20
-        current = float(closes.iloc[-1])
-        sma20v = float(sma20.iloc[-1])
-        lower_v = float(lower_bb.iloc[-1])
-        upper_v = float(upper_bb.iloc[-1])
-        sma50v = float(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else None
+        sma20v = float(sma20.dropna().iloc[-1]) if not sma20.dropna().empty else current
+        lower_v = float(lower_bb.dropna().iloc[-1]) if not lower_bb.dropna().empty else current * 0.95
+        upper_v = float(upper_bb.dropna().iloc[-1]) if not upper_bb.dropna().empty else current * 1.05
+        sma50_series = closes.rolling(50).mean().dropna()
+        sma50v = float(sma50_series.iloc[-1]) if len(closes) >= 50 and not sma50_series.empty else None
         bb_pos = round((current - lower_v) / (upper_v - lower_v), 2) if (upper_v - lower_v) > 0 else 0.5
-        avg_vol = float(volumes.rolling(20).mean().iloc[-1])
+        pct_sma20 = round((current - sma20v) / sma20v * 100, 2) if sma20v > 0 else 0
+        pct_sma50 = round((current - sma50v) / sma50v * 100, 2) if sma50v and sma50v > 0 else None
+        avg_vol = float(volumes.rolling(20).mean().dropna().iloc[-1]) if not volumes.rolling(20).mean().dropna().empty else 1
         vol_ratio = round(float(volumes.iloc[-1]) / avg_vol, 2) if avg_vol > 0 else 1.0
-        atr = round(float((hist['High'] - hist['Low']).rolling(14).mean().iloc[-1]), 2)
-        atr_pct = round(atr / current * 100, 2)
-        chg1d = round((current - float(closes.iloc[-2])) / float(closes.iloc[-2]) * 100, 2) if len(closes) >= 2 else 0
-        chg5d = round((current - float(closes.iloc[-6])) / float(closes.iloc[-6]) * 100, 2) if len(closes) >= 6 else 0
+        atr_series = (hist['High'] - hist['Low']).rolling(14).mean().dropna()
+        atr = round(float(atr_series.iloc[-1]), 2) if not atr_series.empty else 0
+        atr_pct = round(atr / current * 100, 2) if current > 0 else 0
+        prev1 = float(closes.iloc[-2]) if len(closes) >= 2 else current
+        prev5 = float(closes.iloc[-6]) if len(closes) >= 6 else current
+        chg1d = round((current - prev1) / prev1 * 100, 2) if prev1 > 0 else 0
+        chg5d = round((current - prev5) / prev5 * 100, 2) if prev5 > 0 else 0
         return {
-            'ticker': ticker, 'current': round(current, 2), 'rsi': rsi,
+            'ticker': ticker, 'current': round(current, 2), 'rsi': round(rsi_val, 1),
             'sma20': round(sma20v, 2), 'sma50': round(sma50v, 2) if sma50v else None,
             'lower_band': round(lower_v, 2), 'upper_band': round(upper_v, 2),
-            'bb_position': bb_pos,
-            'pct_from_sma20': round((current - sma20v) / sma20v * 100, 2),
-            'pct_from_sma50': round((current - sma50v) / sma50v * 100, 2) if sma50v else None,
+            'bb_position': bb_pos, 'pct_from_sma20': pct_sma20, 'pct_from_sma50': pct_sma50,
             'volume_ratio': vol_ratio, 'atr': atr, 'atr_pct': atr_pct,
             'change_1d': chg1d, 'change_5d': chg5d
         }
@@ -723,6 +760,7 @@ def load_positions():
         assigned_ws = wb['AssignedPositions']
         open_puts = []
         assigned = []
+        buy_writes = []
         puts_headers = [clean_header(c.value) for c in puts_ws[3]]
         for row in puts_ws.iter_rows(min_row=4, values_only=True):
             if row[0] is None: continue
@@ -733,10 +771,20 @@ def load_positions():
             if row[0] is None: continue
             pos = {h: row[i] for i, h in enumerate(assigned_headers) if h}
             assigned.append(pos)
-        return open_puts, assigned
+        if 'BuyWrites' in wb.sheetnames:
+            bw_ws = wb['BuyWrites']
+            bw_headers = [clean_header(c.value) for c in bw_ws[4]]
+            for row in bw_ws.iter_rows(min_row=5, values_only=True):
+                if row[0] is None: continue
+                # Stop at summary section
+                if str(row[0]).startswith('Total') or str(row[0]).startswith('Avg'):
+                    break
+                bw = {h: row[i] for i, h in enumerate(bw_headers) if h}
+                buy_writes.append(bw)
+        return open_puts, assigned, buy_writes
     except Exception as ex:
         print('Warning: Could not read positions.xlsx: ' + str(ex))
-        return [], []
+        return [], [], []
 
 def check_stops(assigned, all_data):
     alerts = []
@@ -860,7 +908,7 @@ def format_candidate_analysis(ticker, current, strike_low, contracts, analyst, i
         L.append('  - ' + r)
     return L, verdict
 
-def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned, macro_events, vix):
+def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned, buy_writes, macro_events, vix):
     now = datetime.now().strftime('%A %B %d, %Y %I:%M %p')
     L = []
     L.append('TRADING BOT MORNING REPORT')
@@ -872,16 +920,53 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, o
     reserve = cfg['portfolio']['dry_powder_reserve']
     committed = sum(float(p.get('Strike',0)) * int(p.get('Contracts',1)) * 100 for p in open_puts if p.get('Strike'))
     assigned_value = sum(float(a.get('CostBasis',0)) * int(a.get('Shares',0)) for a in assigned if a.get('CostBasis'))
-    total_deployed = committed + assigned_value
+    # BuyWrites capital = PurchasePrice x Shares
+    bw_value = 0
+    for bw in buy_writes:
+        try:
+            price = float(bw.get('PurchasePrice') or bw.get('Purchase\nPrice') or 0)
+            shares = int(bw.get('Shares') or 0)
+            bw_value += price * shares
+        except:
+            pass
+    total_deployed = committed + assigned_value + bw_value
     available = total - reserve - total_deployed
     L.append('Total portfolio value:    $' + format(int(total), ','))
     L.append('Dry powder reserve:       $' + format(int(reserve), ','))
     L.append('Cash in open puts:        $' + format(int(committed), ','))
+    L.append('Cash in buy-write stocks: $' + format(int(bw_value), ','))
     L.append('Cash in assigned stocks:  $' + format(int(assigned_value), ','))
     L.append('Total deployed:           $' + format(int(total_deployed), ','))
-    L.append('Available for new puts:   $' + format(int(available), ','))
+    L.append('Available for new trades: $' + format(int(available), ','))
     L.append('Note: Update total_value in config.json as it changes.')
     L.append('')
+    # Buy-write open positions summary
+    if buy_writes:
+        L.append('BUY-WRITE OPEN POSITIONS')
+        L.append('-' * 40)
+        total_bw_gain = 0
+        for bw in buy_writes:
+            try:
+                ticker = str(bw.get('Ticker',''))
+                shares = int(bw.get('Shares') or 0)
+                strike = float(bw.get('CallStrike') or bw.get('Call\nStrike') or 0)
+                expiry = bw.get('CallExpiry') or bw.get('Call\nExpiry') or 'N/A'
+                expiry_str = expiry.strftime('%Y-%m-%d') if hasattr(expiry, 'strftime') else str(expiry)
+                prem = float(bw.get('CallPremium') or bw.get('Call\nPremium') or 0)
+                purchase = float(bw.get('PurchasePrice') or bw.get('Purchase\nPrice') or 0)
+                net_basis = purchase - (prem / shares) if shares > 0 else purchase
+                max_gain = (strike - net_basis) * shares if strike > 0 else 0
+                total_bw_gain += max_gain
+                current_data = all_data.get(ticker)
+                current_str = '$' + str(current_data['current']) if current_data else 'N/A'
+                buffer = round((current_data['current'] - strike) / strike * 100, 1) if current_data and current_data.get('current') else None
+                buffer_str = (str(buffer) + '% above call strike') if buffer is not None else 'N/A'
+                L.append(ticker + ' | ' + str(shares) + ' shares @ $' + str(round(purchase,2)) + ' | Call: $' + str(strike) + ' exp ' + expiry_str)
+                L.append('  Current: ' + current_str + ' | ' + buffer_str + ' | Max gain: $' + str(round(max_gain, 2)))
+            except Exception as ex:
+                L.append(str(bw.get('Ticker','?')) + ' | Error reading: ' + str(ex))
+        L.append('Total max gain if all called away: $' + format(round(total_bw_gain, 2), ','))
+        L.append('')
     L.append('SECTION B - WEEKLY PUT CANDIDATES TODAY')
     L.append('-' * 40)
     today = date.today()
@@ -1110,149 +1195,302 @@ def find_buy_write_candidates(cfg, all_data, earnings_tickers, tech_cache):
         if data['high_proximity_pct'] > 15:
             continue
         current = data['current']
-        # Call strike ~5% below current price
-        call_strike = round(current * 0.95, 2)
-        # Fetch IV to estimate ITM call premium
-        iv_data = None
         try:
             stock = yf.Ticker(ticker)
             opt_dates = stock.options
-            if opt_dates:
-                # Use nearest expiry
-                chain = stock.option_chain(opt_dates[0])
-                calls = chain.calls
-                # Find closest call to 5% OTM strike
-                atm_calls = calls[abs(calls['strike'] - call_strike) < current * 0.03]
-                if not atm_calls.empty:
-                    iv = float(atm_calls['impliedVolatility'].mean())
-                    bid = float(atm_calls['bid'].mean())
-                    ask = float(atm_calls['ask'].mean())
-                    mid = round((bid + ask) / 2, 2)
-                    # Estimated premium per share
-                    intrinsic = max(0, current - call_strike)
-                    time_value = max(0, mid - intrinsic)
-                    # Net return if called away
-                    stock_loss = call_strike - current  # negative
-                    net_per_share = mid + stock_loss
-                    net_pct = net_per_share / current
-                    if net_pct >= 0.01:  # meets 1% weekly target
-                        # Get analyst data
-                        analyst = get_analyst_data(ticker)
-                        tech = tech_cache.get(ticker)
-                        earnings_dt, earnings_days = get_earnings_date(ticker)
-                        candidates.append({
-                            'ticker': ticker,
-                            'current': current,
-                            'call_strike': call_strike,
-                            'call_premium_mid': mid,
-                            'intrinsic': round(intrinsic, 2),
-                            'time_value': round(time_value, 2),
-                            'stock_loss_per_share': round(stock_loss, 2),
-                            'net_per_share': round(net_per_share, 2),
-                            'net_pct': round(net_pct * 100, 2),
-                            'expiry': opt_dates[0],
-                            'analyst': analyst,
-                            'tech': tech,
-                            'earnings_dt': earnings_dt,
-                            'earnings_days': earnings_days,
-                            'iv': round(iv * 100, 1),
-                            'proximity_pct': data['high_proximity_pct'],
-                            'week_high': data['week_high'],
-                        })
+            if not opt_dates:
+                continue
+            # Use nearest weekly expiry
+            chain = stock.option_chain(opt_dates[0])
+            calls = chain.calls
+            if calls.empty:
+                continue
+            # Scan ALL ITM calls (strikes below current price, from 0.5% to 8% below)
+            # This mirrors the real approach — find the strike with the best net return
+            best_candidate = None
+            best_net_pct = 0.0
+            for _, call_row in calls.iterrows():
+                strike = float(call_row['strike'])
+                # Only consider ITM calls (below current price)
+                if strike >= current:
+                    continue
+                # Only consider strikes between 0.5% and 8% below current
+                discount_pct = (current - strike) / current
+                if discount_pct < 0.005 or discount_pct > 0.08:
+                    continue
+                bid = float(call_row.get('bid', 0) or 0)
+                ask = float(call_row.get('ask', 0) or 0)
+                iv = float(call_row.get('impliedVolatility', 0) or 0)
+                if bid <= 0 or ask <= 0:
+                    continue
+                mid = round((bid + ask) / 2, 2)
+                # Skip if spread is too wide (> 20% of mid) — liquidity concern
+                if (ask - bid) / mid > 0.20:
+                    continue
+                intrinsic = max(0, current - strike)
+                time_value = max(0, mid - intrinsic)
+                stock_loss = strike - current  # negative number
+                net_per_share = mid + stock_loss
+                net_pct = net_per_share / current
+                # Must meet 1% weekly minimum
+                if net_pct < 0.01:
+                    continue
+                if net_pct > best_net_pct:
+                    best_net_pct = net_pct
+                    best_candidate = {
+                        'ticker': ticker,
+                        'current': current,
+                        'call_strike': strike,
+                        'strike_discount_pct': round(discount_pct * 100, 2),
+                        'call_premium_mid': mid,
+                        'intrinsic': round(intrinsic, 2),
+                        'time_value': round(time_value, 2),
+                        'stock_loss_per_share': round(stock_loss, 2),
+                        'net_per_share': round(net_per_share, 2),
+                        'net_pct': round(net_pct * 100, 2),
+                        'expiry': opt_dates[0],
+                        'iv': round(iv * 100, 1),
+                        'proximity_pct': data['high_proximity_pct'],
+                        'week_high': data['week_high'],
+                        'bid': bid,
+                        'ask': ask,
+                    }
+            if best_candidate is None:
+                continue
+            # Enrich with analyst and technical data
+            best_candidate['analyst'] = get_analyst_data(ticker)
+            best_candidate['tech'] = tech_cache.get(ticker)
+            best_candidate['earnings_dt'], best_candidate['earnings_days'] = get_earnings_date(ticker)
+            candidates.append(best_candidate)
         except Exception as ex:
             pass
-    # Sort by net return percentage descending
-    candidates.sort(key=lambda x: x['net_pct'], reverse=True)
-    return candidates[:5]  # top 5 candidates
+    # ── Risk-adjusted scoring ─────────────────────────────────────
+    # Score each candidate on return AND risk — higher is better
+    for c in candidates:
+        score = 0
+        analyst = c.get('analyst', {}) or {}
+        tech = c.get('tech') or {}
+
+        # Return component (0-40 points)
+        net_pct = c['net_pct']
+        if net_pct >= 3.0:   score += 40
+        elif net_pct >= 2.0: score += 30
+        elif net_pct >= 1.5: score += 20
+        elif net_pct >= 1.0: score += 10
+
+        # Time value component — more time value = more cushion (0-10 points)
+        tv_pct = c['time_value'] / c['current'] * 100 if c['current'] > 0 else 0
+        if tv_pct >= 1.0:   score += 10
+        elif tv_pct >= 0.5: score += 5
+
+        # Beta risk penalty (0 to -20 points)
+        beta_risk = analyst.get('beta_risk', 'MODERATE')
+        if beta_risk == 'VERY HIGH':   score -= 20
+        elif beta_risk == 'HIGH':      score -= 10
+        elif beta_risk == 'LOW':       score += 5
+
+        # Technical risk (RSI) — avoid overbought (0 to -15 points)
+        rsi = tech.get('rsi', 50) if tech else 50
+        if rsi > 75:        score -= 15
+        elif rsi > 65:      score -= 8
+        elif rsi < 35:      score += 8  # oversold = good support
+        elif rsi < 45:      score += 4
+
+        # BB Position — avoid near upper band (0 to -10 points)
+        bb = tech.get('bb_position', 0.5) if tech else 0.5
+        if bb > 0.85:       score -= 10
+        elif bb > 0.70:     score -= 5
+        elif bb < 0.30:     score += 5  # near lower band = support
+
+        # Analyst consensus bonus (0 to +10 points)
+        rec = analyst.get('rec', '')
+        if rec == 'STRONG BUY':  score += 10
+        elif rec == 'BUY':       score += 5
+
+        # Earnings penalty
+        earnings_days = c.get('earnings_days')
+        if earnings_days is not None:
+            if earnings_days <= 5:   score -= 50  # automatic disqualifier
+            elif earnings_days <= 7: score -= 20
+            elif earnings_days <= 14: score -= 10
+
+        # Proximity to 52W high — avoid stocks already very extended
+        prox = c.get('proximity_pct', 10)
+        if prox < 3:   score -= 10  # within 3% of high, stretched
+        elif prox > 10: score += 5  # more room above = safer
+
+        # Bid/ask spread quality — tight spread = good liquidity
+        if c['ask'] > 0 and c['bid'] > 0:
+            spread_pct = (c['ask'] - c['bid']) / c['call_premium_mid'] * 100
+            if spread_pct < 5:    score += 5
+            elif spread_pct > 15: score -= 5
+
+        c['risk_score'] = score
+        c['tv_pct'] = round(tv_pct, 2)
+
+        # Risk label
+        if score >= 50:    c['risk_label'] = 'LOW RISK'
+        elif score >= 30:  c['risk_label'] = 'MODERATE RISK'
+        elif score >= 10:  c['risk_label'] = 'ELEVATED RISK'
+        else:              c['risk_label'] = 'HIGH RISK'
+
+    # Remove any earnings disqualifiers
+    candidates = [c for c in candidates if c.get('earnings_days') is None or c['earnings_days'] > 5]
+
+    # Sort by risk-adjusted score descending
+    candidates.sort(key=lambda x: x['risk_score'], reverse=True)
+
+    # Add capital sizing — deploy available cash across top candidates
+    try:
+        wb = openpyxl.load_workbook(POSITIONS_FILE)
+        cfg_total = None
+        # Try to get available capital from config
+        with open('C:\\TradingBot\\config.json') as f:
+            import json as _json
+            _cfg = _json.load(f)
+            total = _cfg['portfolio']['total_value']
+            reserve = _cfg['portfolio']['dry_powder_reserve']
+            available = total - reserve
+        # Distribute available capital across top 5 candidates evenly
+        top_n = min(5, len(candidates))
+        if top_n > 0:
+            per_position = int(available / top_n / 100) * 100  # round to nearest $100
+            for c in candidates[:top_n]:
+                shares = int(per_position / c['current'] / 100) * 100  # round to nearest 100 shares
+                shares = max(100, shares)  # minimum 1 contract
+                c['suggested_shares'] = shares
+                c['suggested_capital'] = round(shares * c['current'], 2)
+                c['suggested_premium'] = round(shares * c['call_premium_mid'], 2)
+                c['suggested_max_gain'] = round(shares * c['net_per_share'], 2)
+    except:
+        for c in candidates:
+            c['suggested_shares'] = 100
+            c['suggested_capital'] = round(100 * c['current'], 2)
+            c['suggested_premium'] = round(100 * c['call_premium_mid'], 2)
+            c['suggested_max_gain'] = round(100 * c['net_per_share'], 2)
+
+    return candidates[:5]
 
 def build_buy_write_section(candidates, macro_events):
     L = []
     L.append('SECTION I - BUY-WRITE CANDIDATES')
     L.append('-' * 40)
-    L.append('Buy stock + immediately write ITM call ~5% below purchase price.')
-    L.append('Target: call premium > stock loss if called away, netting 1%+ weekly.')
-    L.append('Only shows candidates where net return meets 1% weekly target.')
+    L.append('Buy stock + immediately write ITM call. Ranked by risk-adjusted return.')
+    L.append('Scans ITM strikes 0.5%-8% below price. Only shows candidates meeting 1%+ weekly target.')
+    L.append('Capital sizing shown assumes equal deployment across top candidates.')
     L.append('')
     if not candidates:
         L.append('No buy-write candidates meeting 1% weekly target today.')
-        L.append('IV may be too low, or no suitable names available.')
+        L.append('IV may be too low, bid/ask spreads too wide, or earnings risk too high.')
         return '\n'.join(L)
     today = date.today()
     next_7_high = [e for e in macro_events if e['impact'] == 'HIGH' and (e['date'] - today).days <= 7]
     macro_warn = next_7_high[0]['name'] if next_7_high else None
-    for c in candidates:
-        analyst = c.get('analyst')
-        tech = c.get('tech')
-        # Determine recommendation
-        verdict = 'CONSIDER'
+
+    # Summary header
+    total_suggested_capital = sum(c.get('suggested_capital', 0) for c in candidates)
+    total_suggested_gain = sum(c.get('suggested_max_gain', 0) for c in candidates)
+    L.append('PORTFOLIO SUMMARY FOR TODAY')
+    L.append('  Candidates found:        ' + str(len(candidates)))
+    L.append('  Total capital to deploy: $' + format(int(total_suggested_capital), ','))
+    L.append('  Total max gain if all called: $' + format(int(total_suggested_gain), ','))
+    if total_suggested_capital > 0:
+        overall_pct = round(total_suggested_gain / total_suggested_capital * 100, 2)
+        L.append('  Portfolio net return:    ' + str(overall_pct) + '%')
+    if macro_warn:
+        L.append('  *** MACRO WARNING: ' + macro_warn + ' within 7 days — consider reducing size ***')
+    L.append('')
+    L.append('=' * 50)
+    L.append('')
+
+    for rank, c in enumerate(candidates, 1):
+        analyst = c.get('analyst') or {}
+        tech = c.get('tech') or {}
+        risk_label = c.get('risk_label', 'MODERATE RISK')
+        risk_score = c.get('risk_score', 0)
+
+        # Verdict
+        if c['net_pct'] >= 2.0 and 'LOW' in risk_label:
+            verdict = 'WRITE NOW'
+        elif c['net_pct'] >= 1.5 and 'HIGH RISK' not in risk_label:
+            verdict = 'WRITE NOW'
+        elif c['net_pct'] >= 1.0 and 'HIGH RISK' not in risk_label:
+            verdict = 'CONSIDER'
+        else:
+            verdict = 'CAUTION'
+
+        if macro_warn:
+            if verdict == 'WRITE NOW': verdict = 'CONSIDER'
+
         reasons_for = []
         reasons_against = []
+
         if c['net_pct'] >= 2.0:
             reasons_for.append('Net return ' + str(c['net_pct']) + '% — well above 1% weekly target')
-            verdict = 'WRITE NOW'
-        elif c['net_pct'] >= 1.0:
-            reasons_for.append('Net return ' + str(c['net_pct']) + '% — meets 1% weekly target')
-            verdict = 'CONSIDER'
-        if c['earnings_days'] is not None and c['earnings_days'] <= 5:
-            verdict = 'AVOID'
-            reasons_against.append('EARNINGS IN ' + str(c['earnings_days']) + ' DAYS — DO NOT enter')
-        elif c['earnings_days'] is not None and c['earnings_days'] <= 14:
-            verdict = 'CAUTION'
-            reasons_against.append('Earnings in ' + str(c['earnings_days']) + ' days')
+        else:
+            reasons_for.append('Net return ' + str(c['net_pct']) + '% — meets weekly target')
+        if c.get('tv_pct', 0) >= 0.5:
+            reasons_for.append('Time value $' + str(c['time_value']) + '/share (' + str(c.get('tv_pct',0)) + '%) — cushion above intrinsic')
+        rsi = tech.get('rsi', 50)
+        bb = tech.get('bb_position', 0.5)
+        if rsi < 40:
+            reasons_for.append('RSI ' + str(rsi) + ' — oversold, downside support')
+        elif rsi > 70:
+            reasons_against.append('RSI ' + str(rsi) + ' — overbought, pullback risk')
+        if bb < 0.30:
+            reasons_for.append('Near lower Bollinger Band — technical support')
+        elif bb > 0.80:
+            reasons_against.append('Near upper Bollinger Band — stretched')
+        beta_risk = analyst.get('beta_risk', 'MODERATE')
+        if beta_risk in ['HIGH', 'VERY HIGH']:
+            reasons_against.append('Beta ' + str(analyst.get('beta','?')) + ' — ' + beta_risk + ', size conservatively')
+        elif beta_risk == 'LOW':
+            reasons_for.append('Beta ' + str(analyst.get('beta','?')) + ' — defensive, lower gap risk')
+        if analyst.get('rec') in ['STRONG BUY', 'BUY']:
+            reasons_for.append('Analyst consensus: ' + analyst['rec'] + ' (' + str(analyst.get('n_analysts','?')) + ' analysts)')
+        if analyst.get('upside') and analyst['upside'] > 20:
+            reasons_against.append('Analyst target ' + str(analyst['upside']) + '% above current — you are selling upside')
+        if c.get('earnings_days') is not None and c['earnings_days'] <= 14:
+            reasons_against.append('Earnings in ' + str(c['earnings_days']) + ' days — gap risk')
         if macro_warn:
-            reasons_against.append('High impact macro event within 7 days: ' + macro_warn)
-            if verdict == 'WRITE NOW':
-                verdict = 'CONSIDER'
-        if tech:
-            if tech['rsi'] > 70:
-                reasons_against.append('RSI ' + str(tech['rsi']) + ' — overbought, stock may pull back')
-                if verdict == 'WRITE NOW': verdict = 'CONSIDER'
-            elif tech['rsi'] < 40:
-                reasons_for.append('RSI ' + str(tech['rsi']) + ' — oversold, downside limited')
-        if analyst:
-            if analyst.get('beta_risk') == 'VERY HIGH':
-                reasons_against.append('Beta ' + str(analyst['beta']) + ' — very high beta, gap risk')
-            elif analyst.get('beta_risk') == 'HIGH':
-                reasons_against.append('Beta ' + str(analyst['beta']) + ' — high beta, size conservatively')
-            if analyst.get('upside') and analyst['upside'] > 15:
-                reasons_against.append('Analyst target ' + str(analyst['upside']) + '% above current — consider if you want stock called away')
-        L.append('*** ' + c['ticker'] + ' — ' + verdict + ' ***')
-        L.append('Current price:      $' + str(c['current']))
-        L.append('52W high:           $' + str(c['week_high']) + ' (' + str(c['proximity_pct']) + '% below high)')
-        L.append('Call strike (5%):   $' + str(c['call_strike']) + ' | Expiry: ' + c['expiry'])
-        L.append('Call premium (mid): $' + str(c['call_premium_mid']) + '/share')
-        L.append('  Intrinsic value:  $' + str(c['intrinsic']) + '/share')
-        L.append('  Time value:       $' + str(c['time_value']) + '/share')
-        L.append('Stock loss if called: $' + str(abs(c['stock_loss_per_share'])) + '/share')
-        L.append('NET RETURN if called: $' + str(c['net_per_share']) + '/share = ' + str(c['net_pct']) + '% weekly')
-        L.append('IV (implied vol):   ' + str(c['iv']) + '%')
-        if analyst:
-            if analyst.get('target'):
-                L.append('Analyst target:     $' + str(analyst['target']) + ' (' + str(analyst['upside']) + '% upside) | ' + str(analyst['rec']))
-            if analyst.get('beta_text'):
-                L.append('Beta:               ' + analyst['beta_text'])
-        if c['earnings_days'] is not None:
-            L.append('Earnings:           ' + str(c['earnings_dt']) + ' (' + str(c['earnings_days']) + ' days)')
-        if tech:
-            L.append('RSI:                ' + str(tech['rsi']) + ' | BB Position: ' + str(tech['bb_position']))
+            reasons_against.append('Macro event within 7 days: ' + macro_warn)
+
+        L.append('#' + str(rank) + ' — ' + c['ticker'] + ' | ' + verdict + ' | ' + risk_label + ' (Score: ' + str(risk_score) + ')')
+        L.append('Current price:          $' + str(c['current']) + ' | 52W high: $' + str(c['week_high']) + ' (' + str(c['proximity_pct']) + '% below)')
+        L.append('Best call strike:        $' + str(c['call_strike']) + ' (' + str(c['strike_discount_pct']) + '% below price) | Expiry: ' + c['expiry'])
+        L.append('Call bid/ask/mid:        $' + str(c['bid']) + ' / $' + str(c['ask']) + ' / $' + str(c['call_premium_mid']) + '/share')
+        L.append('  Intrinsic / Time val:  $' + str(c['intrinsic']) + ' / $' + str(c['time_value']) + ' per share')
+        L.append('Stock loss if called:    $' + str(abs(c['stock_loss_per_share'])) + '/share')
+        L.append('NET RETURN if called:    $' + str(c['net_per_share']) + '/share = ' + str(c['net_pct']) + '%')
+        L.append('IV (implied vol):        ' + str(c['iv']) + '%')
+        if analyst.get('target'):
+            L.append('Analyst:                 $' + str(analyst['target']) + ' target | ' + str(analyst.get('upside','?')) + '% upside | ' + str(analyst.get('rec','?')))
+        if tech.get('rsi'):
+            L.append('Technicals:              RSI ' + str(tech['rsi']) + ' | BB ' + str(bb) + ' | vs SMA20: ' + str(tech.get('pct_from_sma20','?')) + '%')
+        if c.get('earnings_days') is not None:
+            L.append('Earnings:                ' + str(c.get('earnings_dt','?')) + ' (' + str(c['earnings_days']) + ' days away)')
         L.append('')
         L.append('RECOMMENDATION: *** ' + verdict + ' ***')
-        for r in reasons_for:
-            L.append('  + ' + r)
-        for r in reasons_against:
-            L.append('  - ' + r)
+        for r in reasons_for:  L.append('  + ' + r)
+        for r in reasons_against: L.append('  - ' + r)
         L.append('')
-        # ATP order ticket
-        shares_tier1 = 100  # 1 contract worth
-        cost = round(c['current'] * shares_tier1, 2)
-        L.append('ATP ORDER TICKET (1 contract = 100 shares)')
-        L.append('  Step 1: BUY 100 shares of ' + c['ticker'] + ' at market ($' + str(c['current']) + '/share = $' + format(int(cost), ',') + ')')
-        L.append('  Step 2: SELL TO OPEN CALL | Strike: $' + str(c['call_strike']) + ' | Expiry: ' + c['expiry'] + ' | Contracts: 1 | LIMIT at mid ($' + str(c['call_premium_mid']) + ')')
+        # Suggested sizing
+        shares = c.get('suggested_shares', 100)
+        cap = c.get('suggested_capital', round(c['current']*100, 2))
+        prem = c.get('suggested_premium', round(c['call_premium_mid']*100, 2))
+        gain = c.get('suggested_max_gain', round(c['net_per_share']*100, 2))
+        contracts = int(shares / 100)
+        L.append('SUGGESTED SIZING (' + str(shares) + ' shares / ' + str(contracts) + ' contract' + ('s' if contracts > 1 else '') + ')')
+        L.append('  Step 1: BUY ' + str(shares) + ' shares ' + c['ticker'])
+        L.append('          Cost: $' + str(c['current']) + '/share = $' + format(int(cap), ',') + ' total')
+        L.append('  Step 2: SELL TO OPEN CALL | Strike: $' + str(c['call_strike']) + ' | Expiry: ' + c['expiry'])
+        L.append('          Contracts: ' + str(contracts) + ' | LIMIT at $' + str(c['call_premium_mid']) + '/share')
+        L.append('          Premium collected: $' + format(int(prem), ','))
         L.append('  Net cost basis: $' + str(round(c['current'] - c['call_premium_mid'], 2)) + '/share')
-        L.append('  Max gain if called away: $' + str(round(c['net_per_share'] * 100, 2)) + ' total')
+        L.append('  Max gain if called: $' + format(int(gain), ',') + ' (' + str(c['net_pct']) + '%)')
         L.append('*** Verify actual bid/ask in ATP before placing order ***')
         L.append('')
-        L.append('-' * 40)
+        L.append('-' * 50)
     return '\n'.join(L)
 
 def update_buy_writes_macro_flags(macro_events):
@@ -1447,7 +1685,7 @@ def main():
         print('Market is closed today. No report generated.')
         return
     print('Loading positions...')
-    open_puts, assigned = load_positions()
+    open_puts, assigned, buy_writes = load_positions()
     open_position_tickers = [p['Ticker'] for p in open_puts] + [a['Ticker'] for a in assigned]
     watchlist = cfg['watchlist']
     print('Fetching VIX and SPY...')
@@ -1493,10 +1731,10 @@ def main():
     update_excel(open_puts, macro_events, tech_cache)
     update_buy_writes_macro_flags(macro_events)
     print('Reloading positions after Excel update...')
-    open_puts, assigned = load_positions()
+    open_puts, assigned, buy_writes = load_positions()
     print('Building report...')
     regime_section = build_market_regime_section(vix, spy_trend, macro_events)
-    report = build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned, macro_events, vix)
+    report = build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, open_puts, assigned, buy_writes, macro_events, vix)
     longer_section = build_longer_dated_section(longer_candidates, macro_events)
     mean_reversion_section = build_mean_reversion_section(mean_reversion_candidates, macro_events)
     sections_cd = build_sections_cd(open_puts, assigned, all_data, rules)
