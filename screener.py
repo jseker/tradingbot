@@ -799,10 +799,15 @@ def load_positions():
             bw_headers = [clean_header(c.value) for c in bw_ws[4]]
             for row in bw_ws.iter_rows(min_row=5, values_only=True):
                 if row[0] is None: continue
-                # Stop at summary section
-                if str(row[0]).startswith('Total') or str(row[0]).startswith('Avg'):
-                    break
+                # Skip summary / label rows — only real positions have a ticker + shares.
+                # Use continue (not break) so a stray label can't truncate later positions.
+                ticker_val = str(row[0]).strip().upper()
+                if any(k in ticker_val for k in ('TOTAL', 'AVG', 'SUMMARY', 'BUY-WRITE')):
+                    continue
                 bw = {h: row[i] for i, h in enumerate(bw_headers) if h}
+                sh = bw.get('Shares')
+                if sh is None or (not isinstance(sh, str) and float(sh) <= 0):
+                    continue
                 buy_writes.append(bw)
         return open_puts, assigned, buy_writes
     except Exception as ex:
@@ -945,6 +950,7 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, o
     assigned_value = sum(float(a.get('CostBasis',0)) * int(a.get('Shares',0)) for a in assigned if a.get('CostBasis'))
     # BuyWrites capital = PurchasePrice x Shares (use raw columns, not formula columns)
     bw_value = 0
+    bw_premium = 0
     for bw in buy_writes:
         try:
             price = bw.get('PurchasePrice') or bw.get('Purchase\nPrice') or 0
@@ -953,21 +959,38 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, o
             if isinstance(price, str) or isinstance(shares, str):
                 continue
             bw_value += float(price) * int(shares)
+            prem = bw.get('CallPremium') or bw.get('Call\nPremium') or 0
+            if not isinstance(prem, str):
+                bw_premium += float(prem)
         except:
             pass
-    total_deployed = committed + assigned_value + bw_value
+    # Net capital actually at risk in a buy-write = stock cost - premium collected.
+    # Covered-call premium is cash received, so it offsets the buying power consumed.
+    bw_net = bw_value - bw_premium
+    total_deployed = committed + assigned_value + bw_net
     available = total - reserve - total_deployed
     L.append('Total portfolio value:    $' + format(int(total), ','))
     L.append('Dry powder reserve:       $' + format(int(reserve), ','))
     L.append('Cash in open puts:        $' + format(int(committed), ','))
     L.append('Cash in buy-write stocks: $' + format(int(bw_value), ','))
+    if bw_premium:
+        L.append('  less call premium recd: -$' + format(int(bw_premium), ','))
     L.append('Cash in assigned stocks:  $' + format(int(assigned_value), ','))
     L.append('Total deployed:           $' + format(int(total_deployed), ','))
-    L.append('Available for new trades: $' + format(int(available), ','))
-    if available < 0:
-        L.append('*** WARNING: OVER-DEPLOYED by $' + format(int(abs(available)), ',') + ' ***')
-    elif available < 25000:
-        L.append('*** CAPITAL NEARLY EXHAUSTED — limited room for new positions ***')
+    surplus = total - total_deployed  # cash above committed capital, before reserve
+    if total_deployed > total:
+        L.append('Available for new trades: $0')
+        L.append('*** WARNING: OVER-DEPLOYED by $' + format(int(total_deployed - total), ',') +
+                 ' — deployed capital exceeds account value. Update total_value in config.json, or verify positions. ***')
+    else:
+        free_for_new = surplus - reserve
+        L.append('Available for new trades: $' + format(int(free_for_new), ','))
+        if free_for_new < 0:
+            L.append('NOTE: Fully deployed. $' + format(int(surplus), ',') + ' sits above committed capital, below your $' +
+                     format(int(reserve), ',') + ' dry-powder target. Not a rule violation — just no spare cash for new ' +
+                     'trades until expiries free up capital.')
+        elif free_for_new < reserve:
+            L.append('NOTE: Limited dry powder — $' + format(int(free_for_new), ',') + ' available beyond your reserve.')
     # Show buy-write expiry summary
     if buy_writes:
         expiring_soon = []
@@ -1014,6 +1037,7 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, o
                 buffer_str = (str(buffer) + '% above call strike') if buffer is not None else 'N/A'
                 L.append(ticker + ' | ' + str(shares) + ' shares @ $' + str(round(purchase,2)) + ' | Call: $' + str(strike) + ' exp ' + expiry_str)
                 L.append('  Current: ' + current_str + ' | ' + buffer_str + ' | Max gain: $' + str(round(max_gain, 2)))
+                L.append('')
             except Exception as ex:
                 L.append(str(bw.get('Ticker','?')) + ' | Error reading: ' + str(ex))
         L.append('Total max gain if all called away: $' + format(round(total_bw_gain, 2), ','))
