@@ -799,12 +799,7 @@ def load_positions():
             bw_headers = [clean_header(c.value) for c in bw_ws[4]]
             for row in bw_ws.iter_rows(min_row=5, values_only=True):
                 if row[0] is None: continue
-                
-                return open_puts, assigned, buy_writes
-    except Exception as ex:
-        print('Warning: Could not read positions.xlsx: ' + str(ex))
-        return [], [], []
-bw = {h: row[i] for i, h in enumerate(bw_headers) if h}
+                bw = {h: row[i] for i, h in enumerate(bw_headers) if h}
                 # Skip summary / label rows — real positions have a positive share count.
                 sh = bw.get('Shares')
                 try:
@@ -813,6 +808,11 @@ bw = {h: row[i] for i, h in enumerate(bw_headers) if h}
                 except (TypeError, ValueError):
                     continue
                 buy_writes.append(bw)
+        return open_puts, assigned, buy_writes
+    except Exception as ex:
+        print('Warning: Could not read positions.xlsx: ' + str(ex))
+        return [], [], []
+
 def check_stops(assigned, all_data):
     alerts = []
     for pos in assigned:
