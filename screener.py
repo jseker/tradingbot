@@ -964,6 +964,31 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, o
     L.append('Cash in assigned stocks:  $' + format(int(assigned_value), ','))
     L.append('Total deployed:           $' + format(int(total_deployed), ','))
     L.append('Available for new trades: $' + format(int(available), ','))
+    if available < 0:
+        L.append('*** WARNING: OVER-DEPLOYED by $' + format(int(abs(available)), ',') + ' ***')
+    elif available < 25000:
+        L.append('*** CAPITAL NEARLY EXHAUSTED — limited room for new positions ***')
+    # Show buy-write expiry summary
+    if buy_writes:
+        expiring_soon = []
+        from datetime import date as _date
+        today = _date.today()
+        for bw in buy_writes:
+            exp = bw.get('CallExpiry')
+            if exp:
+                exp_date = exp.date() if hasattr(exp, 'date') else exp
+                days_left = (exp_date - today).days
+                if days_left <= 7:
+                    capital = float(bw.get('PurchasePrice',0)) * int(bw.get('Shares',0)) if not isinstance(bw.get('PurchasePrice'), str) else 0
+                    expiring_soon.append((bw.get('Ticker','?'), days_left, exp_date, capital))
+        if expiring_soon:
+            total_freeing = sum(c for _,_,_,c in expiring_soon)
+            L.append('')
+            L.append('BUY-WRITE POSITIONS EXPIRING WITHIN 7 DAYS:')
+            for ticker, days, exp_dt, cap in expiring_soon:
+                label = 'FRIDAY' if days <= 4 else str(days) + ' days'
+                L.append('  ' + ticker + ' expires ' + label + ' (' + str(exp_dt) + ') — frees $' + format(int(cap), ','))
+            L.append('  Total capital freeing up: $' + format(int(total_freeing), ','))
     L.append('Note: Update total_value in config.json as it changes.')
     L.append('')
     # Buy-write open positions summary
@@ -1413,12 +1438,66 @@ def build_buy_write_section(candidates, macro_events):
     next_7_high = [e for e in macro_events if e['impact'] == 'HIGH' and (e['date'] - today).days <= 7]
     macro_warn = next_7_high[0]['name'] if next_7_high else None
 
+    # Check available capital from config
+    available_capital = 313000  # default
+    expiring_capital = 0
+    expiring_tickers = []
+    try:
+        import json as _json
+        with open('C:\\TradingBot\\config.json') as _f:
+            _cfg = _json.load(_f)
+        _total = _cfg['portfolio']['total_value']
+        _reserve = _cfg['portfolio']['dry_powder_reserve']
+        available_capital = _total - _reserve
+    except:
+        pass
+
+    # Check buy-write positions for expiry
+    try:
+        _wb = openpyxl.load_workbook(POSITIONS_FILE, read_only=True, data_only=True)
+        _ws_bw = _wb['BuyWrites']
+        _bw_hdrs = [clean_header(c.value) for c in _ws_bw[4]]
+        for _row in _ws_bw.iter_rows(min_row=5, values_only=True):
+            if _row[0] is None: continue
+            if str(_row[0]).startswith('Total') or str(_row[0]).startswith('  '): break
+            _bw = {_bw_hdrs[i]: _row[i] for i, h in enumerate(_bw_hdrs) if h}
+            _ticker = _bw.get('Ticker','')
+            _price = _bw.get('PurchasePrice') or 0
+            _shares = _bw.get('Shares') or 0
+            _exp = _bw.get('CallExpiry')
+            if _exp and _ticker and not isinstance(_price, str):
+                _exp_date = _exp.date() if hasattr(_exp, 'date') else _exp
+                _days = (_exp_date - date.today()).days
+                _cap = float(_price) * int(_shares)
+                if _days <= 7:
+                    expiring_capital += _cap
+                    expiring_tickers.append((_ticker, _days, round(_cap, 0)))
+    except:
+        pass
+
+    capital_insufficient = available_capital < (candidates[0]['suggested_capital'] if candidates else 0)
+
     # Summary header
     total_suggested_capital = sum(c.get('suggested_capital', 0) for c in candidates)
     total_suggested_gain = sum(c.get('suggested_max_gain', 0) for c in candidates)
     L.append('PORTFOLIO SUMMARY FOR TODAY')
     L.append('  Candidates found:        ' + str(len(candidates)))
     L.append('  Total capital to deploy: $' + format(int(total_suggested_capital), ','))
+    if capital_insufficient and expiring_capital > 0:
+        L.append('')
+        L.append('*** CAPITAL STATUS: INSUFFICIENT FOR NEW POSITIONS TODAY ***')
+        L.append('  Capital tied up in buy-writes expiring this week:')
+        for t_ticker, t_days, t_cap in expiring_tickers:
+            label = 'THIS FRIDAY' if t_days <= 4 else 'in ' + str(t_days) + ' days'
+            L.append('    ' + t_ticker + ' expires ' + label + ' — frees $' + format(int(t_cap), ','))
+        L.append('  Total freeing up: $' + format(int(expiring_capital), ','))
+        L.append('  RECOMMENDATION: Wait until current positions expire before entering new buy-writes.')
+        L.append('  Re-evaluate candidates Monday morning with fresh capital.')
+        L.append('')
+    elif capital_insufficient:
+        L.append('*** WARNING: Insufficient capital for suggested position sizes ***')
+        L.append('  Consider reducing share count or waiting for capital to free up.')
+        L.append('')
     L.append('  Total max gain if all called: $' + format(int(total_suggested_gain), ','))
     if total_suggested_capital > 0:
         overall_pct = round(total_suggested_gain / total_suggested_capital * 100, 2)
@@ -1444,6 +1523,14 @@ def build_buy_write_section(candidates, macro_events):
             verdict = 'CONSIDER'
         else:
             verdict = 'CAUTION'
+
+        # Override verdict if capital is tied up
+        if capital_insufficient and expiring_capital > 0:
+            if verdict in ['WRITE NOW', 'CONSIDER']:
+                verdict = 'WAIT — CAPITAL TIED UP UNTIL FRIDAY'
+        elif capital_insufficient:
+            if verdict in ['WRITE NOW', 'CONSIDER']:
+                verdict = 'WAIT — INSUFFICIENT CAPITAL'
 
         if macro_warn:
             if verdict == 'WRITE NOW': verdict = 'CONSIDER'
@@ -1712,7 +1799,15 @@ def main():
         return
     print('Loading positions...')
     open_puts, assigned, buy_writes = load_positions()
-    open_position_tickers = [p['Ticker'] for p in open_puts] + [a['Ticker'] for a in assigned]
+    print('Positions loaded: ' + str(len(open_puts)) + ' puts, ' + str(len(assigned)) + ' assigned, ' + str(len(buy_writes)) + ' buy-writes')
+    if buy_writes:
+        bw_cap = sum(float(bw.get('PurchasePrice',0)) * int(bw.get('Shares',0))
+                     for bw in buy_writes
+                     if not isinstance(bw.get('PurchasePrice'), str) and bw.get('PurchasePrice'))
+        print('Buy-write capital: $' + format(int(bw_cap), ','))
+    open_position_tickers = ([p['Ticker'] for p in open_puts] +
+                             [a['Ticker'] for a in assigned] +
+                             [bw['Ticker'] for bw in buy_writes if bw.get('Ticker')])
     watchlist = cfg['watchlist']
     print('Fetching VIX and SPY...')
     vix = get_vix()
