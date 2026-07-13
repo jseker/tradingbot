@@ -714,9 +714,17 @@ def find_longer_dated_candidates(cfg, all_data, earnings_tickers, open_positions
             time_factor = (dte / 365) ** 0.5
             est_prem = round(current * 0.20 * time_factor * 0.20, 2)
             roi = round(est_prem / strike * 100, 2)
+            # For short-week trades (DTE <= 5), use raw ROI as the weekly equivalent
+            # rather than normalizing up by 7/DTE — the capital is idle over weekends anyway
+            if dte <= 5:
+                weekly_roi = round(roi, 2)
+                roi_label = 'RAW (' + str(dte) + 'D)'
+            else:
+                weekly_roi = round(roi / weeks, 2)
+                roi_label = 'WEEKLY'
             exp_results.append({'exp_date':exp_date,'dte':dte,'weeks':weeks,'strike':strike,
                                  'notional':notional,'est_prem':est_prem,'roi':roi,
-                                 'weekly_roi':round(roi/weeks,2)})
+                                 'weekly_roi':weekly_roi,'roi_label':roi_label})
         if not exp_results:
             continue
         candidates.append({'ticker':ticker,'group':ticker_group,'current':current,
@@ -1129,7 +1137,8 @@ def build_longer_dated_section(candidates, macro_events):
         for r in reasons_against: L.append('  - ' + r)
         L.append('')
         for e in c['expiries']:
-            L.append('  ' + e['exp_date'] + ' (' + str(e['dte']) + ' DTE) | Strike: $' + str(e['strike']) + ' | Est prem: $' + str(e['est_prem']) + ' | Weekly ROI: ' + str(e['weekly_roi']) + '%')
+            roi_display = e.get('roi_label', 'WEEKLY')
+            L.append('  ' + e['exp_date'] + ' (' + str(e['dte']) + ' DTE) | Strike: $' + str(e['strike']) + ' | Est prem: $' + str(e['est_prem']) + ' | ' + roi_display + ' ROI: ' + str(e['weekly_roi']) + '%')
         if c['expiries']:
             best = c['expiries'][0]
             L.append('  ORDER: SELL PUT | ' + c['ticker'] + ' | ' + best['exp_date'] + ' | $' + str(best['strike']) + ' | Verify delta ~0.20 in ATP')
@@ -1306,8 +1315,11 @@ def find_buy_write_candidates(cfg, all_data, earnings_tickers, tech_cache):
                 stock_loss = strike - current  # negative number
                 net_per_share = mid + stock_loss
                 net_pct = net_per_share / current
-                # Must meet 1% weekly minimum
-                if net_pct < 0.01:
+                # Floor adjusts for short-week trades (DTE <= 5):
+                # Capital is idle over weekends, so a proportional floor is fairer
+                # e.g. 4-day trade floor = 1% * (4/7) = 0.571% rather than flat 1%
+                dte_floor = 0.01 * (dte / 7) if dte <= 5 else 0.01
+                if net_pct < dte_floor:
                     continue
                 if net_pct > best_net_pct:
                     best_net_pct = net_pct
@@ -1537,12 +1549,23 @@ def build_buy_write_section(candidates, macro_events):
         risk_label = c.get('risk_label', 'MODERATE RISK')
         risk_score = c.get('risk_score', 0)
 
-        # Verdict
-        if c['net_pct'] >= 2.0 and 'LOW' in risk_label:
+        # Verdict — thresholds scale down for short-week trades (DTE <= 5)
+        # e.g. for a 4-day trade, 2% threshold becomes 2% * (4/7) = 1.14%
+        _bw_expiry = c.get('expiry', '')
+        try:
+            _bw_dte = (date.fromisoformat(str(_bw_expiry)) - date.today()).days
+        except:
+            _bw_dte = 7
+        _scale = min(1.0, _bw_dte / 7) if _bw_dte <= 5 else 1.0
+        _t_high = round(2.0 * _scale, 2)
+        _t_mid  = round(1.5 * _scale, 2)
+        _t_low  = round(1.0 * _scale, 2)
+        _dte_note = ' (DTE-adjusted)' if _bw_dte <= 5 else ''
+        if c['net_pct'] >= _t_high and 'LOW' in risk_label:
             verdict = 'WRITE NOW'
-        elif c['net_pct'] >= 1.5 and 'HIGH RISK' not in risk_label:
+        elif c['net_pct'] >= _t_mid and 'HIGH RISK' not in risk_label:
             verdict = 'WRITE NOW'
-        elif c['net_pct'] >= 1.0 and 'HIGH RISK' not in risk_label:
+        elif c['net_pct'] >= _t_low and 'HIGH RISK' not in risk_label:
             verdict = 'CONSIDER'
         else:
             verdict = 'CAUTION'
