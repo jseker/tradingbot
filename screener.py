@@ -825,12 +825,16 @@ def check_stops(assigned, all_data):
         highest = float(pos.get('HighestPriceSeen') or cost_basis)
         if ticker not in all_data or all_data[ticker] is None: continue
         current = all_data[ticker]['current']
-        static_stop = round(cost_basis * 0.95, 2)
+        # Use adjusted basis (subtract call premium per share) for stop calculation
+        shares = int(pos.get('Shares') or 1)
+        call_premium_total = float(pos.get('CallPremium') or 0)
+        adj_basis = cost_basis - (call_premium_total / shares if shares > 0 else 0)
+        static_stop = round(adj_basis * 0.95, 2)
         trailing_active = current >= cost_basis * 1.10 or highest >= cost_basis * 1.10
         trailing_stop = round(highest * 0.95, 2)
         stop_price = trailing_stop if trailing_active else static_stop
         stop_type = 'TRAILING' if trailing_active else 'STATIC'
-        pnl_pct = round((current - cost_basis) / cost_basis * 100, 2)
+        pnl_pct = round((current - adj_basis) / adj_basis * 100, 2)
         has_cc = pos.get('CoveredCallStrike') is not None
         status = 'OK'
         if current <= stop_price:
@@ -950,7 +954,9 @@ def build_report(cfg, candidates, earnings_tickers, all_data, watchlist_flags, o
     total = cfg['portfolio']['total_value']
     reserve = cfg['portfolio']['dry_powder_reserve']
     committed = sum(float(p.get('Strike',0)) * int(p.get('Contracts',1)) * 100 for p in open_puts if p.get('Strike'))
-    assigned_value = sum(float(a.get('CostBasis',0)) * int(a.get('Shares',0)) for a in assigned if a.get('CostBasis'))
+    # Exclude from AssignedPositions any ticker already counted in BuyWrites to avoid double-counting
+    bw_tickers = set(bw.get('Ticker','') for bw in buy_writes if bw.get('Ticker'))
+    assigned_value = sum(float(a.get('CostBasis',0)) * int(a.get('Shares',0)) for a in assigned if a.get('CostBasis') and a.get('Ticker','') not in bw_tickers)
     # BuyWrites capital = PurchasePrice x Shares (use raw columns, not formula columns)
     bw_value = 0
     bw_premium = 0
@@ -1470,7 +1476,7 @@ def build_buy_write_section(candidates, macro_events):
     macro_warn = next_7_high[0]['name'] if next_7_high else None
 
     # Check available capital from config
-    available_capital = 313000  # default
+    available_capital = 0  # default — will be set from config below
     expiring_capital = 0
     expiring_tickers = []
     try:
@@ -1738,6 +1744,8 @@ def get_performance_summary():
         for row in ws.iter_rows(min_row=4, values_only=True):
             if row[0] is None: continue
             trade = {h: row[i] for i, h in enumerate(headers) if h}
+            # Skip rows marked OPEN — these are not yet closed trades
+            if str(trade.get('Outcome','')).upper() == 'OPEN': continue
             trades.append(trade)
         if not trades: return None
         total = len(trades)
@@ -1778,7 +1786,7 @@ def get_performance_summary():
             'avg_return':round(sum(returns)/len(returns)*100,2) if returns else 0,
             'best':round(max(returns)*100,2) if returns else 0,
             'worst':round(min(returns)*100,2) if returns else 0,
-            'total_premium':round(sum(r['prem'] for r in results),2),
+            'total_premium':round(sum(r['prem'] + r['call'] for r in results),2),
             'total_btc_paid':round(sum(r['btc_amt'] for r in results),2),
             'total_call':round(sum(r['call'] for r in results),2),
             'total_income':round(sum(r['total_income'] for r in results),2),
